@@ -135,7 +135,7 @@ namespace FFXIV_FBX_to_Fusion
                     System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo();
                     startInfo.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
                     startInfo.FileName = blender_path;
-                    startInfo.Arguments = "-P \"" + pythonFilePath + "\"";
+                    startInfo.Arguments = "-b -P \"" + pythonFilePath + "\"";
                     process.StartInfo = startInfo;
                     process.Start();
 
