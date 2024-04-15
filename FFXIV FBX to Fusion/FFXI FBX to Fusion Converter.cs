@@ -85,6 +85,8 @@ namespace FFXIV_FBX_to_Fusion
 
                     string pythonFilePath = Path.Combine(Path.GetTempPath(), "ffxiv_fbx_to_fusion.py");
 
+                    blender_path_label.Text = pythonFilePath;
+
                     string[] lines =
                     {
                         "import bpy",
@@ -94,37 +96,33 @@ namespace FFXIV_FBX_to_Fusion
                         "objs = bpy.data.objects",
                         "objs.remove(objs['Cube'], do_unlink=True)",
                         "",
-                        "os.chdir('" + (working_path) + "')",
+                        // Escape problematic characters
+                        "os.chdir('" + working_path.Replace("\\","\\\\") + "')",
                         "",
                         "# Import .fbx model",
                         "bpy.ops.import_scene.fbx(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.fbx'))",
-                        "# Export to .obj format",
+                        // Export to .obj format
                         "bpy.ops.wm.obj_export(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.obj'))",
                         "",
                         "with open(os.path.join(os.getcwd(), '" + prefix + "' + '.mtl'), 'r') as file: ",
                         "  ",
-                        "    # Reading the content of the file ",
-                        "    # using the read() function and storing ",
-                        "    # them in a new variable ",
+                        //   Reading the content of the file
+                        //   using the read() function and storing
+                        //   them in a new variable
                         "    data = file.read() ",
                         "  ",
-                        "    # Searching and replacing the text ",
-                        "    # using the replace() function ",
+                        // Searching and replacing the text
+                        // using the replace() function
                         "    data = data.replace('C:/', '') ",
                         "    data = data.replace('" + prefix + "' + '_a_d.png', '" + prefix + "' + '_a_' + '" + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + "' + '.png')",
                         "  ",
-                        "# Opening our text file in write only ",
-                        "# mode to write the replaced content ",
+                        // Opening our text file in write only
+                        // mode to write the replaced content
                         "with open(os.path.join(os.getcwd(), '" + prefix + "') + '.mtl', 'w') as file: ",
                         "  ",
-                        "    # Writing the replaced data in our ",
-                        "    # text file ",
-                        "    file.write(data)",
-                        "",
-                        "# Force use of specular for diffuse",
-                        "",
-                        "# Printing Text replaced ",
-                        "print('.mtl file repaired')"
+                        //   Writing the replaced data in our
+                        //   text file ",
+                        "    file.write(data)"
                     };
 
                     using (StreamWriter outputFile = new StreamWriter(pythonFilePath))
@@ -137,7 +135,7 @@ namespace FFXIV_FBX_to_Fusion
                     System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo();
                     startInfo.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
                     startInfo.FileName = blender_path;
-                    startInfo.Arguments = "-b -P " + pythonFilePath;
+                    startInfo.Arguments = "-P \"" + pythonFilePath + "\"";
                     process.StartInfo = startInfo;
                     process.Start();
 
