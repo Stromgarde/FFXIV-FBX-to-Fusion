@@ -38,7 +38,6 @@
             select_fbx_button = new Button();
             blender_path_label = new Label();
             fbx_path_label = new Label();
-            debug_label = new Label();
             panel1.SuspendLayout();
             SuspendLayout();
             // 
@@ -147,23 +146,11 @@
             fbx_path_label.TabIndex = 6;
             fbx_path_label.Text = "FBX File Path";
             // 
-            // debug_label
-            // 
-            debug_label.AutoSize = true;
-            debug_label.Location = new Point(35, 197);
-            debug_label.MaximumSize = new Size(490, 0);
-            debug_label.Name = "debug_label";
-            debug_label.Size = new Size(71, 15);
-            debug_label.TabIndex = 7;
-            debug_label.Text = "debug_label";
-            debug_label.Click += label1_Click;
-            // 
             // FFXIV_FBX_to_Fusion
             // 
             AutoScaleDimensions = new SizeF(7F, 15F);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(496, 468);
-            Controls.Add(debug_label);
+            ClientSize = new Size(496, 163);
             Controls.Add(fbx_path_label);
             Controls.Add(blender_path_label);
             Controls.Add(select_fbx_button);
@@ -192,6 +179,5 @@
         private Button select_fbx_button;
         private Label blender_path_label;
         private Label fbx_path_label;
-        private Label debug_label;
     }
 }

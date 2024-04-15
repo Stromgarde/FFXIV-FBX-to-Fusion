@@ -87,26 +87,16 @@ namespace FFXIV_FBX_to_Fusion
                             "import sys",
                             "",
                             "objs = bpy.data.objects",
-                            "objs.remove(objs['Cube'], do_unlink=True)"/*,
+                            "objs.remove(objs['Cube'], do_unlink=True)",
                             "",
-                            "os.chdir(" + (working_path) + ")",
-                            "for file in os.listdir(os.getcwd()):",
-                            "	if file.endswith('fbx'):",
-                            "		bpy.ops.import_scene.fbx(filepath=os.path.join(os.getcwd(),file))",
-                            "		# File will be named after the last .fbx file found in the directory.",
-                            "		filename = file.split('.fbx')[0]",
+                            "os.chdir('" + (working_path) + "')",
                             "",
-                            "try:",
-                            "	print(filename)",
-                            "except:",
-                            "	print('No fbx file found.')",
-                            "	exit()",
-                            "",
+                            "# Import .fbx model",
+                            "bpy.ops.import_scene.fbx(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.fbx'))",
                             "# Export to .obj format",
-                            "bpy.ops.wm.obj_export(filepath=os.path.join(os.getcwd(), filename + '.obj'))",
+                            "bpy.ops.wm.obj_export(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.obj'))",
                             "",
-                            "# Text manipulation to remove the bugged portion of the ",
-                            "with open(filename + '.mtl', 'r') as file: ",
+                            "with open(os.path.join(os.getcwd(), '" + prefix + "' + '.mtl'), 'r') as file: ",
                             "  ",
                             "    # Reading the content of the file ",
                             "    # using the read() function and storing ",
@@ -116,11 +106,11 @@ namespace FFXIV_FBX_to_Fusion
                             "    # Searching and replacing the text ",
                             "    # using the replace() function ",
                             "    data = data.replace('C:/', '') ",
-                            "    data = data.replace(filename + '_a_d.png', filename + '_a_' + " + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + "'.png')",
+                            "    data = data.replace('" + prefix + "' + '_a_d.png', '" + prefix + "' + '_a_' + '" + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + "' + '.png')",
                             "  ",
                             "# Opening our text file in write only ",
                             "# mode to write the replaced content ",
-                            "with open(filename + '.mtl', 'w') as file: ",
+                            "with open(os.path.join(os.getcwd(), '" + prefix + "') + '.mtl', 'w') as file: ",
                             "  ",
                             "    # Writing the replaced data in our ",
                             "    # text file ",
@@ -129,7 +119,7 @@ namespace FFXIV_FBX_to_Fusion
                             "# Force use of specular for diffuse",
                             "",
                             "# Printing Text replaced ",
-                            "print('.mtl file repaired') "*/
+                            "print('.mtl file repaired')"
                         };
 
                         using (StreamWriter outputFile = new StreamWriter(pythonFilePath))
@@ -138,15 +128,8 @@ namespace FFXIV_FBX_to_Fusion
                                 outputFile.WriteLine(line);
                         }
 
-                        if (File.Exists(pythonFilePath))
-                        {
-                            debug_label.Text = File.ReadAllText(pythonFilePath);
-                        }
-
                         powerShell.AddCommand(blender_path)
-                            .AddParameter(" -P", pythonFilePath);
-
-                        //.AddParameter("P","E:\\project\\convert.py");
+                            .AddParameter("-P", pythonFilePath);
 
                         Collection<PSObject> PSOutput = powerShell.Invoke();
                     }
