@@ -158,7 +158,7 @@
             Controls.Add(convert_button);
             Controls.Add(blender_location_button);
             Name = "FFXIV_FBX_to_Fusion";
-            Text = "Form1";
+            Text = "FFXIV_FBX_to_Fusion";
             Load += Form1_Load;
             panel1.ResumeLayout(false);
             panel1.PerformLayout();

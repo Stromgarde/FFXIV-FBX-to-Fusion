@@ -18,8 +18,8 @@ namespace FFXIV_FBX_to_Fusion
 {
     public partial class FFXIV_FBX_to_Fusion : Form
     {
-        private String? blender_path = null;
-        private String? fbx_path = null;
+        private String blender_path = "";
+        private String fbx_path = "";
 
 
         public FFXIV_FBX_to_Fusion()
@@ -52,11 +52,17 @@ namespace FFXIV_FBX_to_Fusion
                 if (Directory.Exists(temp_path))
                 {
                     String latest_path = Directory.GetDirectories(drive + "Program Files\\Blender Foundation\\")[Directory.GetDirectories(drive + "Program Files\\Blender Foundation\\").Length - 1];
-                    float version_number = float.Parse(FileVersionInfo.GetVersionInfo(latest_path + "\\blender.exe").FileVersion);
-                    if (version_number >= 4)
+                    if (FileVersionInfo.GetVersionInfo(latest_path + "\\blender.exe").FileVersion != null)
                     {
-                        blender_path = latest_path + "\\blender.exe";
-                        blender_path_label.Text = blender_path;
+                        float version_number = float.Parse(FileVersionInfo.GetVersionInfo(latest_path + "\\blender.exe").FileVersion);
+                        if (version_number >= 4)
+                        {
+                            blender_path = latest_path + "\\blender.exe";
+                            blender_path_label.Text = blender_path;
+                        }
+                    } else
+                    {
+                        blender_path_label.Text = "Invalid version selected";
                     }
                 }
             }
@@ -69,72 +75,71 @@ namespace FFXIV_FBX_to_Fusion
         }
         private void Convert()
         {
-            if ((blender_path != null) && (fbx_path != null))
+            if ((blender_path != "") && (fbx_path != ""))
             {
                 string working_path = System.IO.Path.GetDirectoryName(fbx_path);
                 string prefix = fbx_path.Split(working_path + "\\")[1].Split(".fbx")[0];
 
                 if (File.Exists(working_path + "\\mt_" + prefix + "_a_" + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + ".png"))
                 {
-                    using (PowerShell powerShell = PowerShell.Create())
+
+                    string pythonFilePath = Path.Combine(Path.GetTempPath(), "ffxiv_fbx_to_fusion.py");
+
+                    string[] lines =
                     {
-                        string pythonFilePath = Path.Combine(Path.GetTempPath(), "ffxiv_fbx_to_fusion.py");
+                        "import bpy",
+                        "import os",
+                        "import sys",
+                        "",
+                        "objs = bpy.data.objects",
+                        "objs.remove(objs['Cube'], do_unlink=True)",
+                        "",
+                        "os.chdir('" + (working_path) + "')",
+                        "",
+                        "# Import .fbx model",
+                        "bpy.ops.import_scene.fbx(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.fbx'))",
+                        "# Export to .obj format",
+                        "bpy.ops.wm.obj_export(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.obj'))",
+                        "",
+                        "with open(os.path.join(os.getcwd(), '" + prefix + "' + '.mtl'), 'r') as file: ",
+                        "  ",
+                        "    # Reading the content of the file ",
+                        "    # using the read() function and storing ",
+                        "    # them in a new variable ",
+                        "    data = file.read() ",
+                        "  ",
+                        "    # Searching and replacing the text ",
+                        "    # using the replace() function ",
+                        "    data = data.replace('C:/', '') ",
+                        "    data = data.replace('" + prefix + "' + '_a_d.png', '" + prefix + "' + '_a_' + '" + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + "' + '.png')",
+                        "  ",
+                        "# Opening our text file in write only ",
+                        "# mode to write the replaced content ",
+                        "with open(os.path.join(os.getcwd(), '" + prefix + "') + '.mtl', 'w') as file: ",
+                        "  ",
+                        "    # Writing the replaced data in our ",
+                        "    # text file ",
+                        "    file.write(data)",
+                        "",
+                        "# Force use of specular for diffuse",
+                        "",
+                        "# Printing Text replaced ",
+                        "print('.mtl file repaired')"
+                    };
 
-                        string[] lines =
-                        {
-                            "import bpy",
-                            "import os",
-                            "import sys",
-                            "",
-                            "objs = bpy.data.objects",
-                            "objs.remove(objs['Cube'], do_unlink=True)",
-                            "",
-                            "os.chdir('" + (working_path) + "')",
-                            "",
-                            "# Import .fbx model",
-                            "bpy.ops.import_scene.fbx(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.fbx'))",
-                            "# Export to .obj format",
-                            "bpy.ops.wm.obj_export(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.obj'))",
-                            "",
-                            "with open(os.path.join(os.getcwd(), '" + prefix + "' + '.mtl'), 'r') as file: ",
-                            "  ",
-                            "    # Reading the content of the file ",
-                            "    # using the read() function and storing ",
-                            "    # them in a new variable ",
-                            "    data = file.read() ",
-                            "  ",
-                            "    # Searching and replacing the text ",
-                            "    # using the replace() function ",
-                            "    data = data.replace('C:/', '') ",
-                            "    data = data.replace('" + prefix + "' + '_a_d.png', '" + prefix + "' + '_a_' + '" + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + "' + '.png')",
-                            "  ",
-                            "# Opening our text file in write only ",
-                            "# mode to write the replaced content ",
-                            "with open(os.path.join(os.getcwd(), '" + prefix + "') + '.mtl', 'w') as file: ",
-                            "  ",
-                            "    # Writing the replaced data in our ",
-                            "    # text file ",
-                            "    file.write(data)",
-                            "",
-                            "# Force use of specular for diffuse",
-                            "",
-                            "# Printing Text replaced ",
-                            "print('.mtl file repaired')"
-                        };
-
-                        using (StreamWriter outputFile = new StreamWriter(pythonFilePath))
-                        {
-                            foreach (string line in lines)
-                                outputFile.WriteLine(line);
-                        }
-
-                        powerShell.AddCommand(blender_path)
-                            .AddParameter("-P", pythonFilePath);
-
-                        Collection<PSObject> PSOutput = powerShell.Invoke();
+                    using (StreamWriter outputFile = new StreamWriter(pythonFilePath))
+                    {
+                        foreach (string line in lines)
+                            outputFile.WriteLine(line);
                     }
 
-                    //blender_path_label.Text = panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1);
+                    System.Diagnostics.Process process = new System.Diagnostics.Process();
+                    System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo();
+                    startInfo.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+                    startInfo.FileName = blender_path;
+                    startInfo.Arguments = "-b -P " + pythonFilePath;
+                    process.StartInfo = startInfo;
+                    process.Start();
                 }
                 else
                 {
