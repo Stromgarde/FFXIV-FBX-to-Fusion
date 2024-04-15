@@ -140,15 +140,17 @@ namespace FFXIV_FBX_to_Fusion
                     startInfo.Arguments = "-b -P " + pythonFilePath;
                     process.StartInfo = startInfo;
                     process.Start();
+
+                    System.Windows.Forms.MessageBox.Show("Conversion complete");
                 }
                 else
                 {
-                    // pop an alert prompting to locate their textures
+                    System.Windows.Forms.MessageBox.Show("Textures not found");
                 }
             }
             else
             {
-                // pop an alert prompting to populate an FBX
+                System.Windows.Forms.MessageBox.Show("Must supply FBX model file with corresponding textures");
             }
         }
 
