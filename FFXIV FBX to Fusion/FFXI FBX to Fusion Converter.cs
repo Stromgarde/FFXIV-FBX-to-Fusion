@@ -84,8 +84,8 @@ namespace FFXIV_FBX_to_Fusion
                 {
 
                     string pythonFilePath = Path.Combine(Path.GetTempPath(), "ffxiv_fbx_to_fusion.py");
-
-                    blender_path_label.Text = pythonFilePath;
+                    string python_working_path = working_path.Replace("\\", "\\\\")
+                        .Replace("'","\\'");
 
                     string[] lines =
                     {
@@ -97,7 +97,7 @@ namespace FFXIV_FBX_to_Fusion
                         "objs.remove(objs['Cube'], do_unlink=True)",
                         "",
                         // Escape problematic characters
-                        "os.chdir('" + working_path.Replace("\\","\\\\") + "')",
+                        "os.chdir('" + python_working_path + "')",
                         "",
                         "# Import .fbx model",
                         "bpy.ops.import_scene.fbx(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.fbx'))",
