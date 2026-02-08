@@ -5,3 +5,5 @@ Manual method:
 3. Open the associated .mtl file and delete the leading "C:\" elements from all texture filenames
 4. Replace references to ~a_d.png with ~a_s for most equipment or ~a_e for Ultimate weapons
 5. Import mesh into Autodesk Fusion
+
+If the textures are not appearing properly and the model appears to have no textures, either press "Shift+F" or go into the menu and toggle "Inspect -> "Display Mesh Face Groups".

@@ -38,6 +38,7 @@
             select_fbx_button = new Button();
             blender_path_label = new Label();
             fbx_path_label = new Label();
+            normal_button = new RadioButton();
             panel1.SuspendLayout();
             SuspendLayout();
             // 
@@ -75,6 +76,7 @@
             // 
             // panel1
             // 
+            panel1.Controls.Add(normal_button);
             panel1.Controls.Add(emissive_button);
             panel1.Controls.Add(opacity_button);
             panel1.Controls.Add(diffuse_button);
@@ -132,7 +134,7 @@
             blender_path_label.AutoSize = true;
             blender_path_label.Location = new Point(125, 39);
             blender_path_label.Name = "blender_path_label";
-            blender_path_label.Size = new Size(134, 15);
+            blender_path_label.Size = new Size(133, 15);
             blender_path_label.TabIndex = 5;
             blender_path_label.Text = "Blender Executable Path";
             blender_path_label.Click += blender_path_label_Click;
@@ -145,6 +147,17 @@
             fbx_path_label.Size = new Size(75, 15);
             fbx_path_label.TabIndex = 6;
             fbx_path_label.Text = "FBX File Path";
+            // 
+            // normal_button
+            // 
+            normal_button.AutoSize = true;
+            normal_button.Location = new Point(21, 114);
+            normal_button.Name = "normal_button";
+            normal_button.Size = new Size(65, 19);
+            normal_button.TabIndex = 6;
+            normal_button.TabStop = true;
+            normal_button.Text = "Normal";
+            normal_button.UseVisualStyleBackColor = true;
             // 
             // FFXIV_FBX_to_Fusion
             // 
@@ -179,5 +192,6 @@
         private Button select_fbx_button;
         private Label blender_path_label;
         private Label fbx_path_label;
+        private RadioButton normal_button;
     }
 }
