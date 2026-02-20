@@ -32,13 +32,14 @@
             convert_button = new Button();
             specular_button = new RadioButton();
             panel1 = new Panel();
+            normal_button = new RadioButton();
             emissive_button = new RadioButton();
             opacity_button = new RadioButton();
             diffuse_button = new RadioButton();
             select_fbx_button = new Button();
             blender_path_label = new Label();
             fbx_path_label = new Label();
-            normal_button = new RadioButton();
+            displacementDeformCheckbox = new CheckBox();
             panel1.SuspendLayout();
             SuspendLayout();
             // 
@@ -86,6 +87,17 @@
             panel1.Size = new Size(107, 137);
             panel1.TabIndex = 3;
             // 
+            // normal_button
+            // 
+            normal_button.AutoSize = true;
+            normal_button.Location = new Point(21, 114);
+            normal_button.Name = "normal_button";
+            normal_button.Size = new Size(65, 19);
+            normal_button.TabIndex = 6;
+            normal_button.TabStop = true;
+            normal_button.Text = "Normal";
+            normal_button.UseVisualStyleBackColor = true;
+            // 
             // emissive_button
             // 
             emissive_button.AutoSize = true;
@@ -104,13 +116,13 @@
             opacity_button.Name = "opacity_button";
             opacity_button.Size = new Size(66, 19);
             opacity_button.TabIndex = 4;
-            opacity_button.TabStop = true;
             opacity_button.Text = "Opacity";
             opacity_button.UseVisualStyleBackColor = true;
             // 
             // diffuse_button
             // 
             diffuse_button.AutoSize = true;
+            diffuse_button.Checked = true;
             diffuse_button.Location = new Point(21, 40);
             diffuse_button.Name = "diffuse_button";
             diffuse_button.Size = new Size(62, 19);
@@ -148,22 +160,22 @@
             fbx_path_label.TabIndex = 6;
             fbx_path_label.Text = "FBX File Path";
             // 
-            // normal_button
+            // displacementDeformCheckbox
             // 
-            normal_button.AutoSize = true;
-            normal_button.Location = new Point(21, 114);
-            normal_button.Name = "normal_button";
-            normal_button.Size = new Size(65, 19);
-            normal_button.TabIndex = 6;
-            normal_button.TabStop = true;
-            normal_button.Text = "Normal";
-            normal_button.UseVisualStyleBackColor = true;
+            displacementDeformCheckbox.Location = new Point(307, 112);
+            displacementDeformCheckbox.Name = "displacementDeformCheckbox";
+            displacementDeformCheckbox.Size = new Size(177, 48);
+            displacementDeformCheckbox.TabIndex = 7;
+            displacementDeformCheckbox.Text = "Displacement Deformation (Experimental)";
+            displacementDeformCheckbox.UseVisualStyleBackColor = true;
+            displacementDeformCheckbox.CheckedChanged += checkBox1_CheckedChanged;
             // 
             // FFXIV_FBX_to_Fusion
             // 
             AutoScaleDimensions = new SizeF(7F, 15F);
             AutoScaleMode = AutoScaleMode.Font;
             ClientSize = new Size(496, 163);
+            Controls.Add(displacementDeformCheckbox);
             Controls.Add(fbx_path_label);
             Controls.Add(blender_path_label);
             Controls.Add(select_fbx_button);
@@ -193,5 +205,6 @@
         private Label blender_path_label;
         private Label fbx_path_label;
         private RadioButton normal_button;
+        private CheckBox displacementDeformCheckbox;
     }
 }

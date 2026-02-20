@@ -1,18 +1,9 @@
 using System;
-using System.ComponentModel;
 using System.Diagnostics;
-using System.Drawing;
-using System.IO;
-using System.Collections;
-using System.Security;
-using System.Windows.Forms;
-using System.Xml.Serialization;
-using System.Management.Automation;
-using System.Collections.ObjectModel;
-using System.Text;
-using System.Security.Cryptography;
-using System.Management.Automation.Runspaces;
-using static System.Windows.Forms.VisualStyles.VisualStyleElement;
+using System.Drawing.Imaging;
+using System.Linq;
+using System.Xml.Linq;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace FFXIV_FBX_to_Fusion
 {
@@ -60,7 +51,8 @@ namespace FFXIV_FBX_to_Fusion
                             blender_path = latest_path + "\\blender.exe";
                             blender_path_label.Text = blender_path;
                         }
-                    } else
+                    }
+                    else
                     {
                         blender_path_label.Text = "Invalid version selected";
                     }
@@ -80,30 +72,111 @@ namespace FFXIV_FBX_to_Fusion
                 string working_path = System.IO.Path.GetDirectoryName(fbx_path);
                 string prefix = fbx_path.Split(working_path + "\\")[1].Split(".fbx")[0];
 
+                // Segment for normalizing
+                string input_file = working_path + "\\mt_" + prefix + "_a_n.png";
+                string output_file = working_path + "\\generated_displacement.png";
+
+                // Set up displacement deformation
+                CheckBox? cb = this.Controls["displacementDeformCheckbox"] as CheckBox;
+                bool normalizeStatus = false;
+                if (cb != null)
+                {
+                    normalizeStatus = true;
+                }
+
+                NormalToDisplacement.NormalConvert(input_file, output_file);
+
+                Debug.WriteLine("Conversion finished via external call.");
+                // End normalization
+
+                Debug.WriteLine("About to enter file check");
                 if (File.Exists(working_path + "\\mt_" + prefix + "_a_" + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + ".png"))
                 {
 
                     string pythonFilePath = Path.Combine(Path.GetTempPath(), "ffxiv_fbx_to_fusion.py");
                     string python_working_path = working_path.Replace("\\", "\\\\")
-                        .Replace("'","\\'");
+                        .Replace("'", "\\'");
 
+                    Debug.WriteLine("Writing first set of Python lines");
                     string[] lines =
                     {
                         "import bpy",
                         "import os",
+                        "import numpy as np",
                         "import sys",
-                        "",
-                        "objs = bpy.data.objects",
-                        "objs.remove(objs['Cube'], do_unlink=True)",
                         "",
                         // Escape problematic characters
                         "os.chdir('" + python_working_path + "')",
                         "",
+                        // Import to Blender, then process
                         "# Import .fbx model",
                         "bpy.ops.import_scene.fbx(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.fbx'))",
+                        "scene = bpy.context.scene",
+
+                        // Processing
+                        "objs = bpy.data.objects",
+                        "objs.remove(objs['Cube'], do_unlink=True)",
+
+                        "obj = bpy.data.objects.get('" + prefix + "')",
+
+                        "if not obj:",
+                        "    raise Exception(f\"Object '{" + prefix + "}' not found.\")",
+                        "if obj is None:",
+                        "    print(f\"Error: Object '{target_object_name}' not found.\")",
+
+                        // Check for child objects
+                        "if obj and obj.type == 'EMPTY':",
+                            // Look for a child that is a mesh
+                        "    mesh_obj = None",
+                        "    for child in obj.children:",
+                        "        if child.type == 'MESH':",
+                        "            mesh_obj = child",
+                        "            break",
+                        "        for grandchild in child.children:",
+                        "            if grandchild.type == 'MESH':",
+                        "                mesh_obj = grandchild",
+                        "                break",
+                    };
+                    if (normalizeStatus)
+                    {
+                        string[] normalize_lines = {
+                            "IMAGE_PATH = '" + output_file.Replace("\\", "\\\\") + "'",
+                            "OBJECT_NAME = '" + prefix + "'",
+                            "SUBDIV_LEVEL = 4", // 4 is as high as can be done without causing massive problems with processing
+                            // --- 0.0015 seems to be strongest without substantial negative impacts on geometry, but 0.004 seems like the "correct" value for when geometry is not an issue
+                            "DISPLACE_STRENGTH = 0.0015",
+
+                            // Make sure we are in object mode
+                            "bpy.ops.object.mode_set(mode = 'OBJECT')",
+                            "bpy.context.view_layer.objects.active = mesh_obj",
+                            "mesh_obj.select_set(True)",
+
+                            // 1. Add Subdivision Surface Modifier
+                            "subsurf = mesh_obj.modifiers.new(name = 'Subdiv', type = 'SUBSURF')",
+                            "subsurf.subdivision_type = 'SIMPLE'",
+                            "subsurf.levels = SUBDIV_LEVEL",
+                            "subsurf.render_levels = SUBDIV_LEVEL",
+
+                            // 2. Add Displace Modifier
+                            "displace = mesh_obj.modifiers.new(name = 'Displace', type = 'DISPLACE')",
+                            "displace.direction = 'NORMAL'",
+                            "displace.strength = DISPLACE_STRENGTH",
+
+                            // 3. Create Texture
+                            "tex = bpy.data.textures.new('NormalMapTex', type = 'IMAGE')",
+                            "img = bpy.data.images.load(IMAGE_PATH)",
+                            "tex.image = img",
+
+                            // 4. Link Texture to Modifier
+                            "displace.texture = tex",
+                            "displace.texture_coords = 'UV'" };
+                        lines = lines.Concat(normalize_lines).ToArray();
+                    }
+                    string[] suffix_lines = {
                         // Export to .obj format
                         "bpy.ops.wm.obj_export(filepath=os.path.join(os.getcwd(), '" + prefix + "' + '.obj'))",
                         "",
+                        // Modify material file to be imported correctly
                         "with open(os.path.join(os.getcwd(), '" + prefix + "' + '.mtl'), 'r') as file: ",
                         "  ",
                         //   Reading the content of the file
@@ -124,6 +197,7 @@ namespace FFXIV_FBX_to_Fusion
                         //   text file ",
                         "    file.write(data)"
                     };
+                    lines = lines.Concat(suffix_lines).ToArray();
 
                     using (StreamWriter outputFile = new StreamWriter(pythonFilePath))
                     {
@@ -205,6 +279,11 @@ namespace FFXIV_FBX_to_Fusion
         }
 
         private void label1_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void checkBox1_CheckedChanged(object sender, EventArgs e)
         {
 
         }

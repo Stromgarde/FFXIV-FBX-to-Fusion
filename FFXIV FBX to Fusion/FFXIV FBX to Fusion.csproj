@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-	<Version>1.3</Version>
+	<Version>2.0a</Version>
     <TargetFramework>net8.0-windows</TargetFramework>
 	<PublishSingleFile>true</PublishSingleFile>
 	<SelfContained>true</SelfContained>
@@ -11,15 +11,27 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>blob_chapeau.ico</ApplicationIcon>
+	<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
   </PropertyGroup>
-
   <ItemGroup>
     <Content Include="blob_chapeau.ico" />
+	<None Update="Shaders.hlsl">
+		<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	</None>
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.2" />
+    <PackageReference Include="ComputeSharp" Version="3.2.0" />
+    <PackageReference Include="ILGPU" Version="1.5.3" />
+    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.5.4" />
+    <PackageReference Include="SharpDX" Version="4.2.0" />
+    <PackageReference Include="SharpDX.D3DCompiler" Version="4.2.0" />
+    <PackageReference Include="SharpDX.Direct3D11" Version="4.2.0" />
+    <PackageReference Include="SharpDX.DXGI" Version="4.2.0" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
     <PackageReference Include="System.Management.Automation" Version="7.4.2" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.2" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.2" />
   </ItemGroup>
 
 </Project>
