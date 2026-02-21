@@ -6,7 +6,7 @@
 //
 // -- NuGet dependencies --------------------------------------------------------
 //   SixLabors.ImageSharp  >= 3.0      (PNG I/O)
-//   ILGPU                 >= 1.5.0    (GPU compute - includes CUDA, OpenCL, CPU backends)
+//   ILGPU                 >= 1.5.0    (GPU compute - CUDA, OpenCL, CPU backends)
 //
 //   dotnet add package SixLabors.ImageSharp
 //   dotnet add package ILGPU
@@ -14,7 +14,20 @@
 // -- GPU backend priority ------------------------------------------------------
 //   1. CUDA  (NVIDIA)  -- requires CUDA Toolkit installed on host
 //   2. OpenCL GPU      -- AMD / Intel / NVIDIA without CUDA Toolkit
-//   3. CPU fallback    -- existing Parallel.For implementation (no GPU required)
+//   3. CPU fallback    -- Parallel.For implementation (no GPU required)
+//
+// -- Edge mode semantics (v5.1) ------------------------------------------------
+//   Free  (default): OOB sample references are ignored; edges can be any height.
+//   Clamp:           All 20 neighbours always sampled; OOB height treated as 0.
+//   Wrap:            Map repeats; OOB coordinates wrap to the other side.
+//
+// -- Channel mapping format ----------------------------------------------------
+//   "XrYgZb"   standard RGB (default)
+//   "XgYaZn"   X from green, Y from alpha, Z absent (treated as straight-up)
+//   "XrYfgZn"  X from red, Y from green flipped, Z absent
+//   Channels: r=red(0), g=green(1), b=blue(2), a=alpha(3)
+//   Prefix 'f' before channel letter flips that component (multiply by -1).
+//   'n' for Z = component absent; Z defaults to 1 (prevents sign-flip errors).
 //
 // -- Example: calling NormalConvert from your primary program ------------------
 //
@@ -30,17 +43,17 @@
 //               scale       : 1.00f,
 //               numPasses   : 4096,
 //               normalScale : 1.000f,
-//               stepHeight  : 75f,
-//               edgeMode    : EdgeMode.Clamp,
+//               stepHeight  : 120f,
+//               edgeMode    : EdgeMode.Free,
 //               normalise   : true,
 //               zRange      : ZRange.Half);
 //       }
 //   }
 //
 // -----------------------------------------------------------------------------
-// Derived from original C++ code:
-// https://skgenius.co.uk/FileDump/NormalToHeight_v0.2.1.zip
-// Discussion here:
+// Derived from the following package:
+// https://skgenius.co.uk/FileDump/NormalToHeight_v0.5.1.zip
+// Discussed here:
 // https://www.reddit.com/r/gamedev/comments/fffskm/convert_normal_map_to_displacement_map/
 
 using System;
@@ -60,35 +73,92 @@ namespace FFXIV_FBX_to_Fusion
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// How out-of-bounds pixel accesses are handled when sampling the normal map
-    /// and height map during the iterative pass.
-    /// Clamp: boundary pixel is repeated (matches CLAMP_EDGES in HLSL).
-    /// Wrap:  texture wraps around (matches WRAPPED_TEXTURE in HLSL).
+    /// How out-of-bounds pixel accesses are handled (v5.1 semantics).
+    /// Free  (default): OOB sample references are ignored; edges float freely.
+    /// Clamp: All 20 neighbours always sampled; OOB height contribution = 0.
+    /// Wrap:  Map is tiling; OOB coordinates wrap to the opposite edge.
     /// </summary>
-    public enum EdgeMode { Clamp, Wrap }
+    public enum EdgeMode { Free, Clamp, Wrap }
 
     /// <summary>
-    /// Indicates the storage range of the Z (blue) channel in the normal map.
-    /// Half: Z is stored in [0.5, 1.0] (positive hemisphere - standard tangent space).
-    /// Full: Z is stored across the full [0, 1] range.
-    /// Both modes use the same linear decode (pixel*2-1, normalise); this enum
-    /// documents content and may be used for future channel-specific remapping.
+    /// Storage range of the Z (blue) channel in the normal map.
+    /// Half:    Z in [0.5, 1.0] -- positive hemisphere (standard tangent space).
+    /// Full:    Z in [0.0, 1.0] mapped to [-1, 1].
+    /// Clamped: Same decode as Full but Z is clamped to [0, 1] after decode,
+    ///          preventing the nz-less-than-0 sign-flip path from triggering.
     /// </summary>
-    public enum ZRange { Half, Full }
+    public enum ZRange { Half, Full, Clamped }
+
+    // -------------------------------------------------------------------------
+    // Channel mapping
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Describes how the RGBA channels of the normal map PNG map to the XYZ
+    /// components of the encoded normal vector.
+    ///
+    /// Parse a mapping string like "XrYgZb", "XgYaZn", "XrYfgZn" via
+    /// <see cref="Parse"/>, or use <see cref="Default"/> for standard RGB.
+    ///
+    /// Format: X[f?][r|g|b|a] Y[f?][r|g|b|a] Z[f?][r|g|b|a|n]
+    ///   - 'f' prefix flips (negates) the component after decoding.
+    ///   - 'n' for Z means the Z channel is absent; Z defaults to 1.0.
+    /// </summary>
+    public struct ChannelMapping
+    {
+        public int XChannel;   // 0=R, 1=G, 2=B, 3=A
+        public bool XFlip;
+        public int YChannel;
+        public bool YFlip;
+        public int ZChannel;   // 0-3, or -1 if absent ('n')
+        public bool ZFlip;
+
+        /// <summary>Standard XrYgZb mapping (red=X, green=Y, blue=Z).</summary>
+        public static readonly ChannelMapping Default =
+            new ChannelMapping { XChannel = 0, YChannel = 1, ZChannel = 2 };
+
+        /// <summary>
+        /// Parses a mapping descriptor string.
+        /// Returns <see cref="Default"/> if the string is null, empty, or malformed.
+        /// </summary>
+        public static ChannelMapping Parse(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return Default;
+
+            var m = Default;
+            int pos = 0;
+
+            // Each token: [X|Y|Z] [f?] [r|g|b|a|n]
+            while (pos < s.Length)
+            {
+                char axis = char.ToUpperInvariant(s[pos]); pos++;
+                if (axis != 'X' && axis != 'Y' && axis != 'Z') continue;
+
+                bool flip = pos < s.Length && char.ToLowerInvariant(s[pos]) == 'f';
+                if (flip) pos++;
+
+                if (pos >= s.Length) break;
+                char ch = char.ToLowerInvariant(s[pos]); pos++;
+                int channel = ch == 'r' ? 0 : ch == 'g' ? 1 : ch == 'b' ? 2 : ch == 'a' ? 3 : -1;
+
+                switch (axis)
+                {
+                    case 'X': m.XChannel = channel; m.XFlip = flip; break;
+                    case 'Y': m.YChannel = channel; m.YFlip = flip; break;
+                    case 'Z': m.ZChannel = channel; m.ZFlip = flip; break;
+                }
+            }
+            return m;
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Progress dialog
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// A lightweight WinForms progress window that lives on its own STA thread
-    /// so it stays responsive while compute threads are busy.
-    ///
-    /// Lifetime:
-    ///   var dlg = ProgressForm.Show();
-    ///   dlg.SetDevice("CUDA - RTX 3080");
-    ///   dlg.Report(pass, total, mip, totalMips, w, h);
-    ///   dlg.CloseAndWait();
+    /// Lightweight WinForms progress window on its own STA thread.
+    /// Lifetime: Show() -> SetDevice() -> Report() (many) -> CloseAndWait().
     /// </summary>
     internal sealed class ProgressForm : Form
     {
@@ -115,18 +185,8 @@ namespace FFXIV_FBX_to_Fusion
                 Text = "Initialising...",
                 ForeColor = System.Drawing.Color.DimGray
             };
-            _lblMip = new Label
-            {
-                AutoSize = true,
-                Location = new System.Drawing.Point(12, 34),
-                Text = ""
-            };
-            _lblPass = new Label
-            {
-                AutoSize = true,
-                Location = new System.Drawing.Point(12, 56),
-                Text = ""
-            };
+            _lblMip = new Label { AutoSize = true, Location = new System.Drawing.Point(12, 34), Text = "" };
+            _lblPass = new Label { AutoSize = true, Location = new System.Drawing.Point(12, 56), Text = "" };
             _bar = new ProgressBar
             {
                 Location = new System.Drawing.Point(12, 82),
@@ -136,69 +196,52 @@ namespace FFXIV_FBX_to_Fusion
                 Value = 0,
                 Style = ProgressBarStyle.Continuous
             };
-
             Controls.AddRange(new Control[] { _lblDevice, _lblMip, _lblPass, _bar });
         }
 
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            _ready.Set();
-        }
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); _ready.Set(); }
 
-        /// <summary>Creates and shows a ProgressForm on a new STA thread. Returns immediately.</summary>
         public static new ProgressForm Show()
         {
             ProgressForm form = null;
-            var formCreated = new ManualResetEventSlim(false);
-
+            var created = new ManualResetEventSlim(false);
             var thread = new Thread(() =>
             {
                 Application.EnableVisualStyles();
                 form = new ProgressForm();
-                formCreated.Set();
+                created.Set();
                 Application.Run(form);
             });
-
             thread.SetApartmentState(ApartmentState.STA);
             thread.IsBackground = true;
             thread.Start();
-
-            formCreated.Wait();
+            created.Wait();
             form._ready.Wait();
             return form;
         }
 
-        /// <summary>Sets the device label (e.g. "CUDA - RTX 3080" or "CPU"). Thread-safe.</summary>
         public void SetDevice(string label)
         {
             if (IsDisposed) return;
-            BeginInvoke(new Action(() =>
-            {
-                if (!IsDisposed) _lblDevice.Text = label;
-            }));
+            BeginInvoke(new Action(() => { if (!IsDisposed) _lblDevice.Text = label; }));
         }
 
-        /// <summary>Updates mip/pass labels and progress bar. Thread-safe, non-blocking.</summary>
         public void Report(int pass, int totalPasses, int mipIndex, int totalMips, int mipW, int mipH)
         {
             if (IsDisposed) return;
-
             int done = totalMips - mipIndex - 1;
             double pct = (done + (double)(pass + 1) / totalPasses) / totalMips * 100.0;
             int barVal = (int)Math.Clamp(pct, 0, 100);
-            int dispMip = totalMips - mipIndex;
-
+            int disp = totalMips - mipIndex;
             BeginInvoke(new Action(() =>
             {
                 if (IsDisposed) return;
-                _lblMip.Text = $"Mip level {dispMip} of {totalMips}  ({mipW}x{mipH})";
+                _lblMip.Text = $"Mip level {disp} of {totalMips}  ({mipW}x{mipH})";
                 _lblPass.Text = $"Pass {pass + 1:N0} of {totalPasses:N0}";
                 _bar.Value = barVal;
             }));
         }
 
-        /// <summary>Closes the form from any thread (fire-and-forget marshal).</summary>
         public void CloseAndWait()
         {
             if (IsDisposed) return;
@@ -211,18 +254,22 @@ namespace FFXIV_FBX_to_Fusion
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// All ILGPU-compilable kernel entry points and their static helper methods.
+    /// ILGPU-compilable kernel entry points.
     ///
-    /// Rules that make these GPU-compilable:
-    ///   - Every method is static.
-    ///   - No access to C# static fields; all state is passed as parameters.
-    ///   - No heap allocation (no new[], no LINQ, no delegates).
-    ///   - GPU memory accessed only through ArrayView&lt;T&gt;.
-    ///   - Uses tan(asin(x)) = x/sqrt(1-x^2) identity to avoid trig intrinsics.
+    /// Edge mode integer encoding used throughout GPU code:
+    ///   0 = Free  -- only in-bounds (flagged) samples contribute
+    ///   1 = Clamp -- all 20 samples always used; OOB height = 0
+    ///   2 = Wrap  -- all 20 samples always used; OOB coords wrap
+    ///
+    /// Restrictions enforced to keep methods GPU-compilable:
+    ///   - All methods are static; no C# static field access.
+    ///   - No heap allocation; GPU memory via ArrayView only.
+    ///   - Lookup tables expressed as if-else chains (foldable by JIT).
+    ///   - tan(asin(x)) replaced by x/sqrt(1-x^2) to avoid trig intrinsics.
     /// </summary>
     internal static class GpuKernels
     {
-        // Direction indices - match HLSL static const int Dir*
+        // Direction index constants -- match HLSL static const int Dir*
         private const int DirNorth = 0;
         private const int DirNorthEast = 1;
         private const int DirEast = 2;
@@ -231,12 +278,6 @@ namespace FFXIV_FBX_to_Fusion
         private const int DirSouthWest = 5;
         private const int DirWest = 6;
         private const int DirNorthWest = 7;
-
-        // -------------------------------------------------------------------------
-        // Constant lookup tables expressed as if-else chains so the ILGPU compiler
-        // can fold them into registers (static readonly arrays are not accessible
-        // from kernel code).
-        // -------------------------------------------------------------------------
 
         private static void GetSampleOffset(int i, out int ox, out int oy)
         {
@@ -276,67 +317,72 @@ namespace FFXIV_FBX_to_Fusion
             if (dir == DirNorthWest) { dx = 1f; dy = -1f; return; }
         }
 
-        // -------------------------------------------------------------------------
-        // Normal sampling helpers
-        // -------------------------------------------------------------------------
+        // ---- Normal sampling ------------------------------------------------
 
+        /// <summary>
+        /// Reads one float channel from the normal map ArrayView.
+        ///
+        /// edgeMode=0 (Free): caller guarantees coords are in-bounds.
+        /// edgeMode=1 (Clamp): OOB returns 0.5 (decodes to 0 after *2-1),
+        ///   yielding a zero normal component -- effectively flat/absent.
+        /// edgeMode=2 (Wrap): coords are wrapped before access.
+        /// </summary>
         private static float SampleCh(
             ArrayView<float> nm, int w, int h,
             int nx, int ny, int ch, int edgeMode)
         {
-            if (edgeMode == 0) // Clamp
+            // Clamp mode: OOB returns 0.5 so (*2-1) decodes to 0
+            if (edgeMode == 1)
             {
-                nx = nx < 0 ? 0 : (nx >= w ? w - 1 : nx);
-                ny = ny < 0 ? 0 : (ny >= h ? h - 1 : ny);
+                if (nx < 0 || nx >= w || ny < 0 || ny >= h) return 0.5f;
             }
-            else // Wrap
+            else if (edgeMode == 2) // Wrap
             {
                 nx = ((nx % w) + w) % w;
                 ny = ((ny % h) + h) % h;
             }
+            // Free: caller only calls with in-bounds coords
             return nm[(ny * w + nx) * 4 + ch];
         }
 
         /// <summary>
-        /// Decodes the normal at (nx, ny), normalises, and applies normalScale to XY.
-        /// Matches HLSL GetNormal() and the CPU SampleNormal() helper.
+        /// Decodes and normalises the normal at (nx, ny).
+        /// Applies normalScale to XY only; Z is used for sign checking only.
+        /// zRange: 0=Half, 1=Full, 2=Clamped (Z clamped to [0,1] after decode).
         /// </summary>
         private static void SampleNormal(
             ArrayView<float> nm, int w, int h,
-            int nx, int ny, int edgeMode, float normalScale,
+            int nx, int ny, int edgeMode, float normalScale, int zRange,
             out float rnx, out float rny, out float rnz)
         {
             float rx = SampleCh(nm, w, h, nx, ny, 0, edgeMode) * 2f - 1f;
             float ry = SampleCh(nm, w, h, nx, ny, 1, edgeMode) * 2f - 1f;
             float rz = SampleCh(nm, w, h, nx, ny, 2, edgeMode) * 2f - 1f;
 
+            // ZRange.Clamped: clamp Z to [0,1] before normalisation
+            // prevents the nz<0 sign-flip from triggering
+            if (zRange == 2 && rz < 0f) rz = 0f;
+
             float len = (float) Math.Sqrt(rx * rx + ry * ry + rz * rz);
             if (len > 1e-6f) { rx /= len; ry /= len; rz /= len; }
 
-            rnx = rx * normalScale;   // XY scaled for contrast control
+            rnx = rx * normalScale;
             rny = ry * normalScale;
-            rnz = rz;                 // Z unscaled; used for sign check only
+            rnz = rz;
         }
 
-        // -------------------------------------------------------------------------
-        // Per-sample delta computation
-        // -------------------------------------------------------------------------
+        // ---- Per-sample delta -----------------------------------------------
 
         /// <summary>
-        /// Computes one height delta from the normal at (px+dx, py+dy) projected
-        /// onto DirVec[dir].
-        ///
-        /// Uses tan(asin(x)) = x / sqrt(1-x^2) to avoid trig functions, which
-        /// are not universally available across GPU ISAs supported by ILGPU.
-        ///
-        /// Matches HLSL GetPixelDelta() and CPU GpuGetPixelDelta().
+        /// Computes one height delta from the normal at (px+dx, py+dy).
+        /// Uses tan(asin(x)) = x/sqrt(1-x^2) to avoid GPU trig intrinsics.
         /// </summary>
         private static float OneDelta(
             ArrayView<float> nm, int w, int h,
             int px, int py, int dx, int dy, int dir,
-            int edgeMode, float normalScale, float maxStepHeight)
+            int edgeMode, float normalScale, float maxStepHeight, int zRange)
         {
-            SampleNormal(nm, w, h, px + dx, py + dy, edgeMode, normalScale,
+            SampleNormal(nm, w, h, px + dx, py + dy, edgeMode, normalScale, zRange,
                 out float nx, out float ny, out float nz);
 
             GetDirVec(dir, out float dvx, out float dvy);
@@ -348,28 +394,27 @@ namespace FFXIV_FBX_to_Fusion
             float xyLen = (float) Math.Sqrt(xyLenSq);
             float clamped = xyLen > 1f ? 1f : xyLen;
             float underRoot = 1f - clamped * clamped;
-
             float tanAsin = underRoot < 1e-6f
-                ? (dist < 0f ? -maxStepHeight : maxStepHeight)   // near-vertical: cap
-                : clamped / (float) Math.Sqrt(underRoot);        // tan(asin(x)) = x/sqrt(1-x^2)
+                ? (dist < 0f ? -maxStepHeight : maxStepHeight)
+                : clamped / (float) Math.Sqrt(underRoot);
 
             float delta = tanAsin * (dist / xyLen);
             if (delta > maxStepHeight) delta = maxStepHeight;
             if (delta < -maxStepHeight) delta = -maxStepHeight;
-            if (nz < 0f) delta = -delta;                          // sign flip for downward normals
+            if (nz < 0f) delta = -delta;
             return delta;
         }
 
-        // -------------------------------------------------------------------------
-        // Kernel: ComputeDeltas
-        // -------------------------------------------------------------------------
+        // ---- Kernel: ComputeDeltas ------------------------------------------
 
         /// <summary>
-        /// GPU equivalent of the GenerateDeltas pixel shader.
-        /// One GPU thread per pixel; writes 20 height deltas and a validity bitmask.
+        /// GPU equivalent of GenerateDeltas pixel shader.
+        /// One thread per pixel; writes 20 deltas and an enable-flags bitmask.
         ///
-        /// edgeMode: 0 = Clamp, 1 = Wrap.
-        /// Output deltas[pixelIdx*20 + i] and enableFlags[pixelIdx].
+        /// edgeMode=0 (Free):  flag bit set only when sample is in-bounds.
+        /// edgeMode=1 (Clamp): all 20 flags always set; OOB normals return 0
+        ///                     from SampleCh (yielding zero delta contribution).
+        /// edgeMode=2 (Wrap):  all 20 flags always set; coords wrap.
         /// </summary>
         public static void ComputeDeltasKernel(
             Index1D pixelIdx,
@@ -379,187 +424,123 @@ namespace FFXIV_FBX_to_Fusion
             int w, int h,
             int edgeMode,
             float normalScale,
-            float maxStepHeight)
+            float maxStepHeight,
+            int zRange)
         {
             if (pixelIdx >= w * h) return;
 
             int px = (int)pixelIdx % w;
             int py = (int)pixelIdx / w;
-            bool wrap = edgeMode != 0;
+            // For Clamp and Wrap modes all flags are set; Free only sets in-bounds
+            bool allSamples = (edgeMode != 0);
 
             uint f = 0u;
             int db = (int)pixelIdx * 20;
 
-            // ---- Samples 0-3: cardinal distance-1 ---------------------------------
-            if (wrap || px > 1)
+            // Samples 0-3: cardinal distance-1
+            if (allSamples || px > 1)
             {
-                deltas[db + 0] = OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 0;
+                deltas[db + 0] = OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 0;
             }
-            if (wrap || py > 1)
+            if (allSamples || py > 1)
             {
-                deltas[db + 1] = OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 1;
+                deltas[db + 1] = OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 1;
             }
-            if (wrap || px < w - 1)
+            if (allSamples || px < w - 1)
             {
-                deltas[db + 2] = OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 2;
+                deltas[db + 2] = OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 2;
             }
-            if (wrap || py < h - 1)
+            if (allSamples || py < h - 1)
             {
-                deltas[db + 3] = OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 3;
+                deltas[db + 3] = OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 3;
             }
-
-            // ---- Samples 4-7: diagonal distance-1 ---------------------------------
-            if (wrap || (px > 1 && py > 1))
+            // Samples 4-7: diagonal distance-1
+            if (allSamples || (px > 1 && py > 1))
             {
-                deltas[db + 4] = OneDelta(normals, w, h, px, py, -1, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 4;
+                deltas[db + 4] = OneDelta(normals, w, h, px, py, -1, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 4;
             }
-            if (wrap || (px < w - 1 && py < h - 1))
+            if (allSamples || (px < w - 1 && py < h - 1))
             {
-                deltas[db + 5] = OneDelta(normals, w, h, px, py, 0, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 5;
+                deltas[db + 5] = OneDelta(normals, w, h, px, py, 0, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 5;
             }
-            if (wrap || (px > 1 && py < h - 1))
+            if (allSamples || (px > 1 && py < h - 1))
             {
-                deltas[db + 6] = OneDelta(normals, w, h, px, py, -1, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 6;
+                deltas[db + 6] = OneDelta(normals, w, h, px, py, -1, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 6;
             }
-            if (wrap || (px < w - 1 && py > 1))
+            if (allSamples || (px < w - 1 && py > 1))
             {
-                deltas[db + 7] = OneDelta(normals, w, h, px, py, 0, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight);
-                f |= 1u << 7;
+                deltas[db + 7] = OneDelta(normals, w, h, px, py, 0, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight, zRange); f |= 1u << 7;
             }
-
-            // ---- Samples 8-11: cardinal distance-2 (sum of 2 OneDelta calls) ------
-            if (wrap || px > 2)
+            // Samples 8-11: cardinal distance-2
+            if (allSamples || px > 2)
             {
-                deltas[db + 8] =
-                    OneDelta(normals, w, h, px, py, -2, 0, DirEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight);
+                deltas[db + 8] = OneDelta(normals, w, h, px, py, -2, 0, DirEast, edgeMode, normalScale, maxStepHeight, zRange)
+                                + OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight, zRange);
                 f |= 1u << 8;
             }
-            if (wrap || py > 2)
+            if (allSamples || py > 2)
             {
-                deltas[db + 9] =
-                    OneDelta(normals, w, h, px, py, 0, -2, DirSouth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight);
+                deltas[db + 9] = OneDelta(normals, w, h, px, py, 0, -2, DirSouth, edgeMode, normalScale, maxStepHeight, zRange)
+                                + OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight, zRange);
                 f |= 1u << 9;
             }
-            if (wrap || px < w - 2)
+            if (allSamples || px < w - 2)
             {
-                deltas[db + 10] =
-                    OneDelta(normals, w, h, px, py, 1, 0, DirWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight);
+                deltas[db + 10] = OneDelta(normals, w, h, px, py, 1, 0, DirWest, edgeMode, normalScale, maxStepHeight, zRange)
+                                + OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight, zRange);
                 f |= 1u << 10;
             }
-            if (wrap || py < h - 2)
+            if (allSamples || py < h - 2)
             {
-                deltas[db + 11] =
-                    OneDelta(normals, w, h, px, py, 0, 1, DirNorth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight);
+                deltas[db + 11] = OneDelta(normals, w, h, px, py, 0, 1, DirNorth, edgeMode, normalScale, maxStepHeight, zRange)
+                                + OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight, zRange);
                 f |= 1u << 11;
             }
-
-            // ---- Samples 12-19: knight-like (4 OneDelta calls * 0.5) --------------
-            if (wrap || (px > 1 && py > 2))
+            // Samples 12-19: knight-like (4 deltas * 0.5)
+            if (allSamples || (px > 1 && py > 2))
             {
-                deltas[db + 12] = (
-                    OneDelta(normals, w, h, px, py, -1, -2, DirSouthEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, -2, DirSouth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 12;
+                deltas[db + 12] = (OneDelta(normals, w, h, px, py, -1, -2, DirSouthEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, -2, DirSouth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 12;
             }
-            if (wrap || (px < w - 1 && py > 2))
+            if (allSamples || (px < w - 1 && py > 2))
             {
-                deltas[db + 13] = (
-                    OneDelta(normals, w, h, px, py, 0, -2, DirSouthWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 1, -2, DirSouth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 13;
+                deltas[db + 13] = (OneDelta(normals, w, h, px, py, 0, -2, DirSouthWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, -1, DirSouth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 1, -2, DirSouth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 13;
             }
-            if (wrap || (px < w - 2 && py > 1))
+            if (allSamples || (px < w - 2 && py > 1))
             {
-                deltas[db + 14] = (
-                    OneDelta(normals, w, h, px, py, 1, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 1, -1, DirWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 14;
+                deltas[db + 14] = (OneDelta(normals, w, h, px, py, 1, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 1, -1, DirWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, -1, DirSouthWest, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 14;
             }
-            if (wrap || (px < w - 2 && py < h - 1))
+            if (allSamples || (px < w - 2 && py < h - 1))
             {
-                deltas[db + 15] = (
-                    OneDelta(normals, w, h, px, py, 1, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 1, 1, DirWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 15;
+                deltas[db + 15] = (OneDelta(normals, w, h, px, py, 1, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, 0, DirWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 1, 1, DirWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 15;
             }
-            if (wrap || (px < w - 1 && py < h - 2))
+            if (allSamples || (px < w - 1 && py < h - 2))
             {
-                deltas[db + 16] = (
-                    OneDelta(normals, w, h, px, py, 0, 1, DirNorthWest, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 1, 1, DirNorth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 16;
+                deltas[db + 16] = (OneDelta(normals, w, h, px, py, 0, 1, DirNorthWest, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 1, 1, DirNorth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, 0, DirNorthWest, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 16;
             }
-            if (wrap || (px > 1 && py < h - 2))
+            if (allSamples || (px > 1 && py < h - 2))
             {
-                deltas[db + 17] = (
-                    OneDelta(normals, w, h, px, py, -1, 1, DirNorthEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, 1, DirNorth, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 17;
+                deltas[db + 17] = (OneDelta(normals, w, h, px, py, -1, 1, DirNorthEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, 0, 0, DirNorth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, 1, DirNorth, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 17;
             }
-            if (wrap || (px > 2 && py < h - 1))
+            if (allSamples || (px > 2 && py < h - 1))
             {
-                deltas[db + 18] = (
-                    OneDelta(normals, w, h, px, py, -2, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -2, 1, DirEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 18;
+                deltas[db + 18] = (OneDelta(normals, w, h, px, py, -2, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -2, 1, DirEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, 0, DirNorthEast, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 18;
             }
-            if (wrap || (px > 2 && py > 1))
+            if (allSamples || (px > 2 && py > 1))
             {
-                deltas[db + 19] = (
-                    OneDelta(normals, w, h, px, py, -2, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -2, -1, DirEast, edgeMode, normalScale, maxStepHeight) +
-                    OneDelta(normals, w, h, px, py, -1, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight)
-                ) * 0.5f;
-                f |= 1u << 19;
+                deltas[db + 19] = (OneDelta(normals, w, h, px, py, -2, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, 0, DirEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -2, -1, DirEast, edgeMode, normalScale, maxStepHeight, zRange) + OneDelta(normals, w, h, px, py, -1, -1, DirSouthEast, edgeMode, normalScale, maxStepHeight, zRange)) * 0.5f; f |= 1u << 19;
             }
 
             enableFlags[(int)pixelIdx] = f;
         }
 
-        // -------------------------------------------------------------------------
-        // Kernel: UpdateHeights
-        // -------------------------------------------------------------------------
+        // ---- Kernel: UpdateHeights ------------------------------------------
 
         /// <summary>
-        /// GPU equivalent of the UpdateHeights pixel shader.
-        /// One GPU thread per pixel, called once per pass.
+        /// GPU equivalent of UpdateHeights pixel shader.  One thread per pixel per pass.
         ///
-        /// Clamp mode (edgeMode=0): uses all 20 neighbours with clamped coordinates,
-        /// matching the #define CLAMP_EDGES path in the HLSL.
-        /// Wrap  mode (edgeMode=1): uses only flagged (in-bounds) neighbours.
+        /// Free  (0): numSamples = popcount(flags); only flagged samples used.
+        /// Clamp (1): numSamples = 20; OOB height = 0 (not boundary-clamped).
+        /// Wrap  (2): numSamples = 20; coords wrap (all in-bounds after wrap).
         /// </summary>
         public static void UpdateHeightsKernel(
             Index1D pixelIdx,
@@ -575,43 +556,47 @@ namespace FFXIV_FBX_to_Fusion
             int px = (int)pixelIdx % w;
             int py = (int)pixelIdx / w;
             uint f = enableFlags[(int)pixelIdx];
-            bool clamp = (edgeMode == 0);
+            int n = (edgeMode == 0) ? Popcnt32(f) : 20;
 
-            int numSamples = clamp ? 20 : Popcnt32(f);
-            if (numSamples == 0) { dst[(int)pixelIdx] = src[(int)pixelIdx]; return; }
+            if (n == 0) { dst[(int)pixelIdx] = src[(int)pixelIdx]; return; }
 
             double height = 0.0;
-            double scale = 1.0 / numSamples;
+            double scale = 1.0 / n;
             int di = (int)pixelIdx * 20;
 
             for (int i = 0; i < 20; i++)
             {
-                if (!clamp && (f & (1u << i)) == 0) continue;
+                // Free mode: skip unflagged (OOB) samples
+                if (edgeMode == 0 && (f & (1u << i)) == 0) continue;
 
                 GetSampleOffset(i, out int ox, out int oy);
+                int nx = px + ox, ny = py + oy;
 
-                int nx, ny;
-                if (clamp)
+                float neighbourHeight;
+                if (edgeMode == 1) // Clamp: OOB = 0 height
                 {
-                    nx = px + ox; if (nx < 0) nx = 0; if (nx >= w) nx = w - 1;
-                    ny = py + oy; if (ny < 0) ny = 0; if (ny >= h) ny = h - 1;
+                    neighbourHeight = (nx >= 0 && nx < w && ny >= 0 && ny < h)
+                        ? src[ny * w + nx]
+                        : 0f;
                 }
-                else
+                else if (edgeMode == 2) // Wrap
                 {
-                    nx = ((px + ox) % w + w) % w;
-                    ny = ((py + oy) % h + h) % h;
+                    nx = ((nx % w) + w) % w;
+                    ny = ((ny % h) + h) % h;
+                    neighbourHeight = src[ny * w + nx];
+                }
+                else // Free: flagged => in-bounds
+                {
+                    neighbourHeight = src[ny * w + nx];
                 }
 
-                double refH = src[ny * w + nx] + deltas[di + i];
-                height += refH * scale;
+                height += (neighbourHeight + deltas[di + i]) * scale;
             }
 
             dst[(int)pixelIdx] = (float)height;
         }
 
-        // -------------------------------------------------------------------------
-        // Kernel: BilinearDownsample4Ch (matches GenNormalMip shader)
-        // -------------------------------------------------------------------------
+        // ---- Kernel: BilinearDownsample4Ch ----------------------------------
 
         public static void BilinearDownsample4ChKernel(
             Index1D dstIdx,
@@ -621,37 +606,24 @@ namespace FFXIV_FBX_to_Fusion
             int dstW, int dstH)
         {
             if (dstIdx >= dstW * dstH) return;
-
-            int dx = (int)dstIdx % dstW;
-            int dy = (int)dstIdx / dstW;
-            float scX = (float)srcW / dstW;
-            float scY = (float)srcH / dstH;
-
-            float sx = (dx + 0.5f) * scX - 0.5f;
-            float sy = (dy + 0.5f) * scY - 0.5f;
-
+            int dx = (int)dstIdx % dstW, dy = (int)dstIdx / dstW;
+            float scX = (float)srcW / dstW, scY = (float)srcH / dstH;
+            float sx = (dx + 0.5f) * scX - 0.5f, sy = (dy + 0.5f) * scY - 0.5f;
             int x0 = (int)sx; if (x0 < 0) x0 = 0; if (x0 >= srcW) x0 = srcW - 1;
             int y0 = (int)sy; if (y0 < 0) y0 = 0; if (y0 >= srcH) y0 = srcH - 1;
             int x1 = x0 + 1; if (x1 >= srcW) x1 = srcW - 1;
             int y1 = y0 + 1; if (y1 >= srcH) y1 = srcH - 1;
-
             float fx = sx - x0; if (fx < 0f) fx = 0f; if (fx > 1f) fx = 1f;
             float fy = sy - y0; if (fy < 0f) fy = 0f; if (fy > 1f) fy = 1f;
-
             int db = (int)dstIdx * 4;
             for (int c = 0; c < 4; c++)
             {
-                float v00 = src[(y0 * srcW + x0) * 4 + c];
-                float v10 = src[(y0 * srcW + x1) * 4 + c];
-                float v01 = src[(y1 * srcW + x0) * 4 + c];
-                float v11 = src[(y1 * srcW + x1) * 4 + c];
-                dst[db + c] = v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) + v01 * (1 - fx) * fy + v11 * fx * fy;
+                dst[db + c] = src[(y0 * srcW + x0) * 4 + c] * (1 - fx) * (1 - fy) + src[(y0 * srcW + x1) * 4 + c] * fx * (1 - fy)
+                         + src[(y1 * srcW + x0) * 4 + c] * (1 - fx) * fy + src[(y1 * srcW + x1) * 4 + c] * fx * fy;
             }
         }
 
-        // -------------------------------------------------------------------------
-        // Kernel: BilinearUpsample1ChX2 (matches UpscaleHeight shader)
-        // -------------------------------------------------------------------------
+        // ---- Kernel: BilinearUpsample1ChX2 ----------------------------------
 
         public static void BilinearUpsample1ChX2Kernel(
             Index1D dstIdx,
@@ -661,33 +633,36 @@ namespace FFXIV_FBX_to_Fusion
             int dstW, int dstH)
         {
             if (dstIdx >= dstW * dstH) return;
-
-            int dx = (int)dstIdx % dstW;
-            int dy = (int)dstIdx / dstW;
-            float scX = (float)srcW / dstW;
-            float scY = (float)srcH / dstH;
-
-            float sx = (dx + 0.5f) * scX - 0.5f;
-            float sy = (dy + 0.5f) * scY - 0.5f;
-
+            int dx = (int)dstIdx % dstW, dy = (int)dstIdx / dstW;
+            float scX = (float)srcW / dstW, scY = (float)srcH / dstH;
+            float sx = (dx + 0.5f) * scX - 0.5f, sy = (dy + 0.5f) * scY - 0.5f;
             int x0 = (int)sx; if (x0 < 0) x0 = 0; if (x0 >= srcW) x0 = srcW - 1;
             int y0 = (int)sy; if (y0 < 0) y0 = 0; if (y0 >= srcH) y0 = srcH - 1;
             int x1 = x0 + 1; if (x1 >= srcW) x1 = srcW - 1;
             int y1 = y0 + 1; if (y1 >= srcH) y1 = srcH - 1;
-
             float fx = sx - x0; if (fx < 0f) fx = 0f; if (fx > 1f) fx = 1f;
             float fy = sy - y0; if (fy < 0f) fy = 0f; if (fy > 1f) fy = 1f;
-
-            float v = src[y0 * srcW + x0] * (1 - fx) * (1 - fy) + src[y0 * srcW + x1] * fx * (1 - fy) +
-                      src[y1 * srcW + x0] * (1 - fx) * fy + src[y1 * srcW + x1] * fx * fy;
-            dst[(int)dstIdx] = v * 2f;
+            dst[(int)dstIdx] = (src[y0 * srcW + x0] * (1 - fx) * (1 - fy) + src[y0 * srcW + x1] * fx * (1 - fy)
+                             + src[y1 * srcW + x0] * (1 - fx) * fy + src[y1 * srcW + x1] * fx * fy) * 2f;
         }
 
-        // -------------------------------------------------------------------------
-        // Utility
-        // -------------------------------------------------------------------------
+        // ---- Kernel: ApplyMask ----------------------------------------------
 
-        /// <summary>Parallel-prefix popcount for a 32-bit value (GPU-friendly, no branch).</summary>
+        /// <summary>
+        /// Zeroes any height pixel where the mask value is below 0.5.
+        /// Applied once after all passes complete.
+        /// </summary>
+        public static void ApplyMaskKernel(
+            Index1D pixelIdx,
+            ArrayView<float> heights,
+            ArrayView<float> mask)
+        {
+            if (pixelIdx >= heights.Length) return;
+            if (mask[(int)pixelIdx] < 0.5f) heights[(int)pixelIdx] = 0f;
+        }
+
+        // ---- Utility --------------------------------------------------------
+
         private static int Popcnt32(uint v)
         {
             v -= (v >> 1) & 0x55555555u;
@@ -701,20 +676,17 @@ namespace FFXIV_FBX_to_Fusion
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Manages an ILGPU context, a discrete-GPU accelerator, and compiled kernel
-    /// delegates.  Create via TryCreate(); returns null if no discrete GPU is
-    /// available.  Implements IDisposable to release GPU resources.
+    /// Manages the ILGPU context, accelerator, and compiled kernel delegates.
+    /// Create via TryCreate(); returns null if no discrete GPU is available.
     /// </summary>
     internal sealed class GpuPipeline : IDisposable
     {
         private readonly Context _ctx;
         private readonly Accelerator _acc;
 
-        // Compiled kernel delegates.
-        // Each generic argument list after Index1D matches the kernel's parameters.
         private readonly Action<Index1D,
             ArrayView<float>, ArrayView<float>, ArrayView<uint>,
-            int, int, int, float, float>
+            int, int, int, float, float, int>
             _computeDeltas;
 
         private readonly Action<Index1D,
@@ -732,50 +704,36 @@ namespace FFXIV_FBX_to_Fusion
             int, int, int, int>
             _upsample1ChX2;
 
-        public string DeviceName { get; }
+        private readonly Action<Index1D,
+            ArrayView<float>, ArrayView<float>>
+            _applyMask;
 
-        // ---- Construction ---------------------------------------------------
+        public string DeviceName { get; }
 
         private GpuPipeline(Context ctx, Accelerator acc, string name)
         {
-            _ctx = ctx;
-            _acc = acc;
-            DeviceName = name;
+            _ctx = ctx; _acc = acc; DeviceName = name;
 
-            // Compile all four kernels once.
-            // LoadAutoGroupedStreamKernel selects optimal group sizes automatically
-            // and uses the accelerator's default stream.
             _computeDeltas = acc.LoadAutoGroupedStreamKernel<
-                Index1D,
-                ArrayView<float>, ArrayView<float>, ArrayView<uint>,
-                int, int, int, float, float>(
-                GpuKernels.ComputeDeltasKernel);
+                Index1D, ArrayView<float>, ArrayView<float>, ArrayView<uint>,
+                int, int, int, float, float, int>(GpuKernels.ComputeDeltasKernel);
 
             _updateHeights = acc.LoadAutoGroupedStreamKernel<
-                Index1D,
-                ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<uint>,
-                int, int, int>(
-                GpuKernels.UpdateHeightsKernel);
+                Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<uint>,
+                int, int, int>(GpuKernels.UpdateHeightsKernel);
 
             _downsample4Ch = acc.LoadAutoGroupedStreamKernel<
-                Index1D,
-                ArrayView<float>, ArrayView<float>,
-                int, int, int, int>(
-                GpuKernels.BilinearDownsample4ChKernel);
+                Index1D, ArrayView<float>, ArrayView<float>,
+                int, int, int, int>(GpuKernels.BilinearDownsample4ChKernel);
 
             _upsample1ChX2 = acc.LoadAutoGroupedStreamKernel<
-                Index1D,
-                ArrayView<float>, ArrayView<float>,
-                int, int, int, int>(
-                GpuKernels.BilinearUpsample1ChX2Kernel);
+                Index1D, ArrayView<float>, ArrayView<float>,
+                int, int, int, int>(GpuKernels.BilinearUpsample1ChX2Kernel);
+
+            _applyMask = acc.LoadAutoGroupedStreamKernel<
+                Index1D, ArrayView<float>, ArrayView<float>>(GpuKernels.ApplyMaskKernel);
         }
 
-        // ---- Factory --------------------------------------------------------
-
-        /// <summary>
-        /// Probes for a discrete GPU in priority order: CUDA -> OpenCL GPU.
-        /// Returns null if none is found or if ILGPU fails to initialise.
-        /// </summary>
         public static GpuPipeline TryCreate()
         {
             Context ctx = null;
@@ -783,100 +741,74 @@ namespace FFXIV_FBX_to_Fusion
             {
                 ctx = Context.CreateDefault();
 
-                // Pass 1: CUDA (NVIDIA)
+                // CUDA (NVIDIA) first
                 foreach (var device in ctx.Devices)
                 {
                     if (device.AcceleratorType != AcceleratorType.Cuda) continue;
                     try
                     {
                         var acc = device.CreateAccelerator(ctx);
-                        Console.WriteLine($"[GpuPipeline] CUDA device: {device.Name}");
+                        Console.WriteLine($"[GpuPipeline] CUDA: {device.Name}");
                         return new GpuPipeline(ctx, acc, $"CUDA - {device.Name}");
                     }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[GpuPipeline] CUDA '{device.Name}' failed: {ex.Message}");
-                    }
+                    catch (Exception ex) { Console.WriteLine($"[GpuPipeline] CUDA failed: {ex.Message}"); }
                 }
 
-                // Pass 2: OpenCL GPU (AMD / Intel / NVIDIA without CUDA toolkit)
+                // OpenCL GPU second
                 foreach (var device in ctx.Devices)
                 {
                     if (device.AcceleratorType != AcceleratorType.OpenCL) continue;
-                    // Exclude OpenCL CPU devices (report themselves as OpenCL)
                     if (device.Name.IndexOf("CPU", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                     try
                     {
                         var acc = device.CreateAccelerator(ctx);
-                        Console.WriteLine($"[GpuPipeline] OpenCL device: {device.Name}");
+                        Console.WriteLine($"[GpuPipeline] OpenCL: {device.Name}");
                         return new GpuPipeline(ctx, acc, $"OpenCL - {device.Name}");
                     }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[GpuPipeline] OpenCL '{device.Name}' failed: {ex.Message}");
-                    }
+                    catch (Exception ex) { Console.WriteLine($"[GpuPipeline] OpenCL failed: {ex.Message}"); }
                 }
 
-                Console.WriteLine("[GpuPipeline] No discrete GPU found. Falling back to CPU.");
-                ctx.Dispose();
-                return null;
+                Console.WriteLine("[GpuPipeline] No discrete GPU found. Using CPU fallback.");
+                ctx.Dispose(); return null;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[GpuPipeline] ILGPU init failed: {ex.Message}");
-                ctx?.Dispose();
-                return null;
+                Console.WriteLine($"[GpuPipeline] Init failed: {ex.Message}");
+                ctx?.Dispose(); return null;
             }
         }
 
         // ---- GPU pipeline stages --------------------------------------------
 
-        /// <summary>
-        /// GPU version of ComputeDeltas.
-        /// Uploads normals, runs ComputeDeltasKernel, downloads results.
-        /// deltasOut and flagsOut must be pre-allocated to (w*h*20) and (w*h).
-        /// </summary>
         public void ComputeDeltas(
             float[] normals, int w, int h,
-            int edgeMode, float normalScale, float maxStepHeight,
+            int edgeMode, float normalScale, float maxStepHeight, int zRange,
             float[] deltasOut, uint[] flagsOut)
         {
             int pixels = w * h;
             using var gpuNormals = _acc.Allocate1D<float>(normals.Length);
             using var gpuDeltas = _acc.Allocate1D<float>((long)pixels * 20);
             using var gpuFlags = _acc.Allocate1D<uint>(pixels);
-
             gpuNormals.CopyFromCPU(normals);
-            gpuDeltas.MemSetToZero();   // unset slots read as 0.0 in UpdateHeights
-
-            _computeDeltas(
-                pixels,
-                gpuNormals.View, gpuDeltas.View, gpuFlags.View,
-                w, h, edgeMode, normalScale, maxStepHeight);
+            gpuDeltas.MemSetToZero();
+            _computeDeltas(pixels, gpuNormals.View, gpuDeltas.View, gpuFlags.View,
+                           w, h, edgeMode, normalScale, maxStepHeight, zRange);
             _acc.Synchronize();
-
             gpuDeltas.CopyToCPU(deltasOut);
             gpuFlags.CopyToCPU(flagsOut);
         }
 
-        /// <summary>
-        /// GPU version of RunPasses.
-        /// Ping-pongs between two GPU buffers for numPasses iterations.
-        /// Deltas and flags are uploaded once; height buffers are kept on-device
-        /// throughout the loop to eliminate redundant transfers.
-        /// </summary>
         public float[] RunPasses(
             float[] initial, float[] deltas, uint[] flags,
             int w, int h, int numPasses, int edgeMode,
+            float[] mask,
             ProgressForm progress, int mipIndex, int totalMips)
         {
             int pixels = w * h;
-
             using var gpuDeltas = _acc.Allocate1D<float>((long)pixels * 20);
             using var gpuFlags = _acc.Allocate1D<uint>(pixels);
             using var gpuBufA = _acc.Allocate1D<float>(pixels);
             using var gpuBufB = _acc.Allocate1D<float>(pixels);
-
             gpuDeltas.CopyFromCPU(deltas);
             gpuFlags.CopyFromCPU(flags);
             gpuBufA.CopyFromCPU(initial);
@@ -886,26 +818,25 @@ namespace FFXIV_FBX_to_Fusion
 
             for (int pass = 0; pass < numPasses; pass++)
             {
-                // Report is a fire-and-forget BeginInvoke; negligible overhead
                 progress.Report(pass, numPasses, mipIndex, totalMips, w, h);
-
-                _updateHeights(
-                    pixels,
-                    src.View, dst.View,
-                    gpuDeltas.View, gpuFlags.View,
-                    w, h, edgeMode);
+                _updateHeights(pixels, src.View, dst.View, gpuDeltas.View, gpuFlags.View, w, h, edgeMode);
                 _acc.Synchronize();
-
                 (src, dst) = (dst, src);
             }
 
-            // Single download at the end of all passes
+            // Apply mask after all passes (GPU)
+            if (mask != null)
+            {
+                using var gpuMask = _acc.Allocate1D<float>(pixels);
+                gpuMask.CopyFromCPU(mask);
+                _applyMask(pixels, src.View, gpuMask.View);
+                _acc.Synchronize();
+            }
+
             return src.GetAsArray1D();
         }
 
-        /// <summary>GPU version of BilinearDownsample4Ch.</summary>
-        public float[] BilinearDownsample4Ch(
-            float[] src, int srcW, int srcH, int dstW, int dstH)
+        public float[] BilinearDownsample4Ch(float[] src, int srcW, int srcH, int dstW, int dstH)
         {
             using var gpuSrc = _acc.Allocate1D<float>(src.Length);
             using var gpuDst = _acc.Allocate1D<float>(dstW * dstH * 4);
@@ -915,9 +846,7 @@ namespace FFXIV_FBX_to_Fusion
             return gpuDst.GetAsArray1D();
         }
 
-        /// <summary>GPU version of BilinearUpsample1Ch_x2.</summary>
-        public float[] BilinearUpsample1ChX2(
-            float[] src, int srcW, int srcH, int dstW, int dstH)
+        public float[] BilinearUpsample1ChX2(float[] src, int srcW, int srcH, int dstW, int dstH)
         {
             using var gpuSrc = _acc.Allocate1D<float>(src.Length);
             using var gpuDst = _acc.Allocate1D<float>(dstW * dstH);
@@ -927,13 +856,7 @@ namespace FFXIV_FBX_to_Fusion
             return gpuDst.GetAsArray1D();
         }
 
-        // ---- IDisposable ----------------------------------------------------
-
-        public void Dispose()
-        {
-            _acc?.Dispose();
-            _ctx?.Dispose();
-        }
+        public void Dispose() { _acc?.Dispose(); _ctx?.Dispose(); }
     }
 
     // -------------------------------------------------------------------------
@@ -941,16 +864,13 @@ namespace FFXIV_FBX_to_Fusion
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Converts a tangent-space normal map to a displacement (height) map.
-    ///
-    /// At runtime, NormalConvert() calls GpuPipeline.TryCreate() to probe for
-    /// a discrete GPU.  If one is found, all heavy compute stages are dispatched
-    /// there via ILGPU kernels.  If none is found, the equivalent Parallel.For
-    /// CPU implementations are used transparently — output is identical.
+    /// Converts a tangent-space normal map to a 16-bit grayscale displacement map.
+    /// Incorporates improvements reverse-engineered from NormalToHeight.exe v5.1.
+    /// Automatically uses a discrete GPU (CUDA/OpenCL) when available.
     /// </summary>
     public static class NormalToDisplacement
     {
-        // Direction constants (CPU-side; mirrored as literals in GpuKernels)
+        // Direction index constants (CPU-side mirror of GpuKernels constants)
         private const int DirNorth = 0;
         private const int DirNorthEast = 1;
         private const int DirEast = 2;
@@ -968,28 +888,34 @@ namespace FFXIV_FBX_to_Fusion
 
         private static readonly (int x, int y)[] SampleOffsets =
         {
-            (-1, 0),(0,-1),(1, 0),(0, 1),
-            (-1,-1),(1, 1),(-1,1),(1,-1),
-            (-2, 0),(0,-2),(2, 0),(0, 2),
-            (-1,-2),(1,-2),(2,-1),(2, 1),
-            ( 1, 2),(-1,2),(-2,1),(-2,-1)
+            (-1,0),(0,-1),(1,0),(0,1),
+            (-1,-1),(1,1),(-1,1),(1,-1),
+            (-2,0),(0,-2),(2,0),(0,2),
+            (-1,-2),(1,-2),(2,-1),(2,1),
+            (1,2),(-1,2),(-2,1),(-2,-1)
         };
 
-        // Per-call state (set once at the top of NormalConvert)
+        // Per-call state
         private static float s_maxStepHeight;
         private static float s_normalScale;
         private static bool s_normalise;
         private static float s_scale;
         private static int s_numPasses;
-        private static EdgeMode s_edgeMode;
+        private static int s_edgeModeInt;   // 0=Free,1=Clamp,2=Wrap
         private static ZRange s_zRange;
+        private static ChannelMapping s_mapping;
 
         // ---- Public entry point ---------------------------------------------
 
         /// <summary>
         /// Converts a normal map to a 16-bit grayscale displacement map PNG.
-        /// Automatically selects GPU (CUDA or OpenCL) when available; otherwise
-        /// falls back to CPU Parallel.For with identical output.
+        ///
+        /// New parameters vs earlier version:
+        ///   mask:      Optional path to a grayscale PNG. Black pixels force height=0.
+        ///   mapping:   Channel mapping string e.g. "XrYgZb" (default), "XgYaZn".
+        ///   outputRaw: If true, saves un-normalised float values scaled only by
+        ///              the diagonal length, ignoring normalise/scale. Equivalent
+        ///              to the -OutputRaw flag in NormalToHeight.exe v5.1.
         /// </summary>
         public static void NormalConvert(
             string inputPath,
@@ -997,52 +923,69 @@ namespace FFXIV_FBX_to_Fusion
             float scale = 1.0f,
             int numPasses = 4096,
             float normalScale = 1.0f,
-            float stepHeight = 250.0f,
-            EdgeMode edgeMode = EdgeMode.Wrap,
+            float stepHeight = 75.0f,
+            EdgeMode edgeMode = EdgeMode.Free,
             bool normalise = true,
-            ZRange zRange = ZRange.Half)
+            ZRange zRange = ZRange.Half,
+            string mask = null,
+            string mapping = null,
+            bool outputRaw = false)
         {
             s_scale = scale;
             s_numPasses = numPasses;
             s_normalScale = normalScale;
             s_maxStepHeight = stepHeight;
-            s_edgeMode = edgeMode;
             s_normalise = normalise;
             s_zRange = zRange;
+            s_mapping = ChannelMapping.Parse(mapping);
 
-            int edgeModeInt = (edgeMode == EdgeMode.Clamp) ? 0 : 1;
+            // Encode edge mode as int: 0=Free, 1=Clamp, 2=Wrap
+            s_edgeModeInt = edgeMode == EdgeMode.Clamp ? 1
+                          : edgeMode == EdgeMode.Wrap ? 2
+                          : 0;
 
-            // Probe for a discrete GPU.  'using' ensures Dispose() even on exception.
+            int zRangeInt = zRange == ZRange.Full ? 1
+                          : zRange == ZRange.Clamped ? 2
+                          : 0;
+
             using GpuPipeline gpu = GpuPipeline.TryCreate();
             bool usingGpu = gpu != null;
-            string backendLabel = usingGpu ? gpu.DeviceName : "CPU (Parallel.For)";
+            string backend = usingGpu ? gpu.DeviceName : "CPU (Parallel.For)";
 
-            Console.WriteLine($"[NormalToDisplacement] Compute backend : {backendLabel}");
-            Console.WriteLine($"[NormalToDisplacement] Loading         : {inputPath}");
+            Console.WriteLine($"[NTD] Backend  : {backend}");
+            Console.WriteLine($"[NTD] EdgeMode : {edgeMode}");
+            Console.WriteLine($"[NTD] Loading  : {inputPath}");
 
             LoadNormalMap(inputPath, out float[] rawNormals, out int imgW, out int imgH);
-            Console.WriteLine($"[NormalToDisplacement] Image size      : {imgW} x {imgH}");
+            Console.WriteLine($"[NTD] Image    : {imgW} x {imgH}");
 
-            // Compute mip pyramid depth (same logic as original C++)
+            // Load optional mask (grayscale, same dimensions as input)
+            float[] maskData = null;
+            if (!string.IsNullOrEmpty(mask))
+            {
+                LoadMask(mask, imgW, imgH, out maskData);
+                Console.WriteLine($"[NTD] Mask     : {mask}");
+            }
+
             int numMips = 0, totalMips;
             { int me = Math.Min(imgW, imgH); while (me > 256) { me /= 2; numMips++; } }
             totalMips = numMips + 1;
-            Console.WriteLine($"[NormalToDisplacement] Mip levels      : {totalMips}  (coarsest first)");
+            Console.WriteLine($"[NTD] Mip levels: {totalMips}");
 
             float[] prevHeights = null;
             int prevW = 0, prevH = 0;
 
             using var progress = ProgressForm.Show();
-            progress.SetDevice(backendLabel);
+            progress.SetDevice(backend);
 
             for (int mip = numMips; mip >= 0; mip--)
             {
                 int step = 1 << mip;
                 int mipW = imgW / step;
                 int mipH = imgH / step;
-                Console.WriteLine($"[NormalToDisplacement]   Mip {mip}: {mipW}x{mipH}");
+                Console.WriteLine($"[NTD]   Mip {mip}: {mipW}x{mipH}");
 
-                // ---- Downsample normal map to mip resolution -----------------
+                // Downsample normals to mip resolution
                 float[] mipNormals;
                 if (mip == 0)
                     mipNormals = rawNormals;
@@ -1051,33 +994,38 @@ namespace FFXIV_FBX_to_Fusion
                 else
                     mipNormals = CpuBilinearDownsample4Ch(rawNormals, imgW, imgH, mipW, mipH);
 
-                // ---- Initialise height map for this mip ---------------------
+                // Downsample mask to mip resolution if present
+                float[] mipMask = null;
+                if (maskData != null)
+                {
+                    mipMask = mip == 0
+                        ? maskData
+                        : CpuBilinearDownsample1Ch(maskData, imgW, imgH, mipW, mipH);
+                }
+
+                // Initialise height map
                 float[] heights;
                 if (prevHeights == null)
-                {
-                    // Coarsest level: sequential left-to-right, top-to-bottom sweep.
-                    // This is inherently serial and fast at the small coarsest size.
                     heights = InitSweep(mipNormals, mipW, mipH);
-                }
                 else if (usingGpu)
                     heights = gpu.BilinearUpsample1ChX2(prevHeights, prevW, prevH, mipW, mipH);
                 else
                     heights = CpuBilinearUpsample1Ch_x2(prevHeights, prevW, prevH, mipW, mipH);
 
-                // ---- Precompute per-pixel 20-neighbour deltas ----------------
+                // Compute deltas
                 var deltas = new float[mipW * mipH * 20];
                 var enableFlags = new uint[mipW * mipH];
 
                 if (usingGpu)
-                    gpu.ComputeDeltas(mipNormals, mipW, mipH, edgeModeInt, normalScale, stepHeight, deltas, enableFlags);
+                    gpu.ComputeDeltas(mipNormals, mipW, mipH, s_edgeModeInt, normalScale, stepHeight, zRangeInt, deltas, enableFlags);
                 else
-                    CpuComputeDeltas(mipNormals, mipW, mipH, deltas, enableFlags);
+                    CpuComputeDeltas(mipNormals, mipW, mipH, deltas, enableFlags, zRangeInt);
 
-                // ---- Iterative height propagation ---------------------------
+                // Iterative height propagation
                 if (usingGpu)
-                    heights = gpu.RunPasses(heights, deltas, enableFlags, mipW, mipH, numPasses, edgeModeInt, progress, mip, totalMips);
+                    heights = gpu.RunPasses(heights, deltas, enableFlags, mipW, mipH, numPasses, s_edgeModeInt, mipMask, progress, mip, totalMips);
                 else
-                    heights = CpuRunPasses(heights, deltas, enableFlags, mipW, mipH, progress, mip, totalMips);
+                    heights = CpuRunPasses(heights, deltas, enableFlags, mipW, mipH, mipMask, progress, mip, totalMips);
 
                 prevHeights = heights;
                 prevW = mipW;
@@ -1086,19 +1034,24 @@ namespace FFXIV_FBX_to_Fusion
 
             progress.CloseAndWait();
 
-            Console.WriteLine($"[NormalToDisplacement] Saving: {outputPath}");
-            SaveHeightMap(prevHeights, prevW, prevH, outputPath);
-            Console.WriteLine("[NormalToDisplacement] Done.");
+            Console.WriteLine($"[NTD] Saving: {outputPath}");
+            SaveHeightMap(prevHeights, prevW, prevH, outputPath, maskData, outputRaw);
+            Console.WriteLine("[NTD] Done.");
         }
 
         // ---- PNG I/O --------------------------------------------------------
 
+        /// <summary>
+        /// Loads a normal map PNG into a flat RGBA float array applying the
+        /// channel mapping specified in <see cref="s_mapping"/>.
+        /// </summary>
         private static void LoadNormalMap(
             string path, out float[] data, out int w, out int h)
         {
             using var img = SixLabors.ImageSharp.Image.Load<Rgba32>(path);
             int lw = img.Width, lh = img.Height;
             float[] ld = new float[lw * lh * 4];
+            var m = s_mapping;
 
             img.ProcessPixelRows(acc =>
             {
@@ -1107,11 +1060,23 @@ namespace FFXIV_FBX_to_Fusion
                     var row = acc.GetRowSpan(y);
                     for (int x = 0; x < lw; x++)
                     {
+                        // Read all four raw channels
+                        float[] raw = {
+                            row[x].R / 255f,
+                            row[x].G / 255f,
+                            row[x].B / 255f,
+                            row[x].A / 255f
+                        };
+
                         int i = (y * lw + x) * 4;
-                        ld[i] = row[x].R / 255f;
-                        ld[i + 1] = row[x].G / 255f;
-                        ld[i + 2] = row[x].B / 255f;
-                        ld[i + 3] = row[x].A / 255f;
+
+                        // Map X component
+                        ld[i] = m.XChannel >= 0 ? (m.XFlip ? 1f - raw[m.XChannel] : raw[m.XChannel]) : 0.5f;
+                        // Map Y component
+                        ld[i + 1] = m.YChannel >= 0 ? (m.YFlip ? 1f - raw[m.YChannel] : raw[m.YChannel]) : 0.5f;
+                        // Map Z component; absent ('n') -> 1.0 (straight up, no sign flip)
+                        ld[i + 2] = m.ZChannel >= 0 ? (m.ZFlip ? 1f - raw[m.ZChannel] : raw[m.ZChannel]) : 1.0f;
+                        ld[i + 3] = raw[3]; // alpha always passthrough
                     }
                 }
             });
@@ -1119,9 +1084,51 @@ namespace FFXIV_FBX_to_Fusion
             w = lw; h = lh; data = ld;
         }
 
-        private static void SaveHeightMap(
-            float[] heights, int w, int h, string outputPath)
+        /// <summary>
+        /// Loads a grayscale mask PNG as a flat float array (one value per pixel).
+        /// Values below 0.5 are considered masked (height = 0).
+        /// If the mask dimensions differ from the image, it is resampled.
+        /// </summary>
+        private static void LoadMask(string path, int expectedW, int expectedH, out float[] data)
         {
+            using var img = SixLabors.ImageSharp.Image.Load<L8>(path);
+            int lw = img.Width, lh = img.Height;
+            float[] ld = new float[lw * lh];
+
+            img.ProcessPixelRows(acc =>
+            {
+                for (int y = 0; y < lh; y++)
+                {
+                    var row = acc.GetRowSpan(y);
+                    for (int x = 0; x < lw; x++)
+                        ld[y * lw + x] = row[x].PackedValue / 255f;
+                }
+            });
+
+            // Resample if mask dimensions differ from the normal map
+            if (lw != expectedW || lh != expectedH)
+                ld = CpuBilinearDownsample1Ch(ld, lw, lh, expectedW, expectedH);
+
+            data = ld;
+        }
+
+        /// <summary>
+        /// Saves the height map as a 16-bit grayscale PNG.
+        /// If mask is provided, masked pixels are zeroed before saving.
+        /// outputRaw skips normalisation and uses diagonal-based scaling.
+        /// </summary>
+        private static void SaveHeightMap(
+            float[] heights, int w, int h,
+            string outputPath, float[] mask, bool outputRaw)
+        {
+            // Apply mask to final output (CPU path or after GPU pass)
+            if (mask != null)
+            {
+                heights = (float[])heights.Clone();
+                for (int i = 0; i < heights.Length; i++)
+                    if (mask[i] < 0.5f) heights[i] = 0f;
+            }
+
             float hMin = float.MaxValue, hMax = float.MinValue;
             foreach (float v in heights)
             {
@@ -1129,6 +1136,7 @@ namespace FFXIV_FBX_to_Fusion
                 if (v > hMax) hMax = v;
             }
             float range = hMax - hMin;
+            float diag = MathF.Sqrt((float)(w * w + h * h));
 
             using var img = new Image<L16>(w, h);
             img.ProcessPixelRows(acc =>
@@ -1139,9 +1147,15 @@ namespace FFXIV_FBX_to_Fusion
                     for (int x = 0; x < w; x++)
                     {
                         float val = heights[y * w + x] - hMin;
-                        float out16 = s_normalise
-                            ? ((range > 0f) ? (val / range) * 65535f : 0f)
-                            : val * (65535f / MathF.Sqrt((float)(w * w + h * h))) * s_scale;
+                        float out16;
+
+                        if (outputRaw)
+                            out16 = val * (65535f / diag);
+                        else if (s_normalise)
+                            out16 = range > 0f ? (val / range) * 65535f : 0f;
+                        else
+                            out16 = val * (65535f / diag) * s_scale;
+
                         row[x] = new L16((ushort)Math.Clamp((int)out16, 0, 65535));
                     }
                 }
@@ -1151,23 +1165,36 @@ namespace FFXIV_FBX_to_Fusion
             img.SaveAsPng(fs);
         }
 
-        // ---- CPU fallback: normal sampling ----------------------------------
+        // ---- CPU: normal decoding -------------------------------------------
 
+        /// <summary>
+        /// Decodes the normal at (nx, ny) applying edge mode and ZRange.
+        /// edgeModeInt: 0=Free (caller guarantees in-bounds),
+        ///              1=Clamp (OOB returns 0.5 -> decodes to 0),
+        ///              2=Wrap.
+        /// </summary>
         private static (float x, float y, float z) SampleNormal(
             float[] normals, int w, int h, int nx, int ny)
         {
-            if (s_edgeMode == EdgeMode.Clamp)
+            if (s_edgeModeInt == 1) // Clamp: OOB -> 0.5 (decodes to 0)
             {
-                nx = Math.Clamp(nx, 0, w - 1);
-                ny = Math.Clamp(ny, 0, h - 1);
+                if (nx < 0 || nx >= w || ny < 0 || ny >= h) return (0f, 0f, 1f);
             }
-            else
+            else if (s_edgeModeInt == 2) // Wrap
             {
                 nx = ((nx % w) + w) % w;
                 ny = ((ny % h) + h) % h;
             }
+            // Free: caller guarantees in-bounds
+
             int i = (ny * w + nx) * 4;
-            float x = normals[i] * 2f - 1f, y = normals[i + 1] * 2f - 1f, z = normals[i + 2] * 2f - 1f;
+            float x = normals[i] * 2f - 1f;
+            float y = normals[i + 1] * 2f - 1f;
+            float z = normals[i + 2] * 2f - 1f;
+
+            // ZRange.Clamped: prevent nz < 0 sign flip
+            if (s_zRange == ZRange.Clamped && z < 0f) z = 0f;
+
             float len = MathF.Sqrt(x * x + y * y + z * z);
             if (len > 1e-6f) { x /= len; y /= len; z /= len; }
             return (x, y, z);
@@ -1182,7 +1209,8 @@ namespace FFXIV_FBX_to_Fusion
             float dist = sx * DirVec[dir].x + sy * DirVec[dir].y;
             float xyLen = Math.Clamp(MathF.Sqrt(sx * sx + sy * sy), 0f, 1f);
             if (xyLen <= 0f) return 0f;
-            float delta = Math.Clamp(MathF.Tan(MathF.Asin(xyLen)) * (dist / xyLen), -s_maxStepHeight, s_maxStepHeight);
+            float delta = Math.Clamp(MathF.Tan(MathF.Asin(xyLen)) * (dist / xyLen),
+                                     -s_maxStepHeight, s_maxStepHeight);
             if (nz < 0f) delta = -delta;
             return delta;
         }
@@ -1198,22 +1226,18 @@ namespace FFXIV_FBX_to_Fusion
             return Math.Clamp(MathF.Tan(MathF.Asin(angDot)) * (dist / angDot), -30f, 30f);
         }
 
-        // ---- CPU fallback: InitSweep (always CPU; sequential by design) -----
+        // ---- CPU: InitSweep -------------------------------------------------
 
         /// <summary>
-        /// Runs four directional sweeps (L->R T->B, R->L B->T, L->R B->T, R->L T->B)
-        /// and averages the results.  The original single L->R T->B pass created a
-        /// strong negative-height artifact on the left edge wherever a downward
-        /// normal chain accumulated unchecked (no left neighbour to counterbalance).
-        /// Averaging four opposing sweeps cancels these directional biases so the
-        /// iterative passes refine shape rather than recover from a bad seed.
+        /// Four-directional sweep averaged to cancel edge bias artifacts.
+        /// Each sweep seeds from a different corner so no edge is privileged.
         /// </summary>
         private static float[] InitSweep(float[] normals, int w, int h)
         {
-            float[] a = SweepPass(normals, w, h, xFwd: true, yFwd: true);   // L->R, T->B
-            float[] b = SweepPass(normals, w, h, xFwd: false, yFwd: false);  // R->L, B->T
-            float[] c = SweepPass(normals, w, h, xFwd: true, yFwd: false);  // L->R, B->T
-            float[] d = SweepPass(normals, w, h, xFwd: false, yFwd: true);   // R->L, T->B
+            float[] a = SweepPass(normals, w, h, xFwd: true, yFwd: true);
+            float[] b = SweepPass(normals, w, h, xFwd: false, yFwd: false);
+            float[] c = SweepPass(normals, w, h, xFwd: true, yFwd: false);
+            float[] d = SweepPass(normals, w, h, xFwd: false, yFwd: true);
 
             float[] result = new float[w * h];
             for (int i = 0; i < w * h; i++)
@@ -1221,25 +1245,12 @@ namespace FFXIV_FBX_to_Fusion
             return result;
         }
 
-        /// <summary>
-        /// A single directional sweep accumulating height deltas from the
-        /// horizontal and vertical neighbours in the chosen direction.
-        /// xFwd=true sweeps left->right; yFwd=true sweeps top->bottom.
-        /// The delta direction vectors flip with the sweep so the normal
-        /// projection remains geometrically correct in each direction.
-        /// </summary>
         private static float[] SweepPass(float[] normals, int w, int h, bool xFwd, bool yFwd)
         {
             float[] hm = new float[w * h];
-
             int yStart = yFwd ? 0 : h - 1;
             int yEnd = yFwd ? h : -1;
             int yStep = yFwd ? 1 : -1;
-
-            // Direction vectors for CpuGetPixelDelta.
-            // When sweeping L->R we accumulate from the left neighbour, so the
-            // "step toward the neighbour" vector is (-1, 0) -- East in HLSL terms.
-            // When sweeping R->L we accumulate from the right neighbour: (+1, 0).
             float xVec = xFwd ? -1f : 1f;
             float yVec = yFwd ? 1f : -1f;
 
@@ -1253,38 +1264,34 @@ namespace FFXIV_FBX_to_Fusion
                 {
                     float sum = 0f; int cnt = 0;
 
-                    // Horizontal neighbour (the pixel we came from in x)
                     int prevX = px - xStep;
                     if (prevX >= 0 && prevX < w)
                     {
-                        float delta = CpuGetPixelDelta(normals, w, h, px, py, xVec, 0f);
-                        sum += hm[py * w + prevX] + delta;
+                        sum += hm[py * w + prevX] + CpuGetPixelDelta(normals, w, h, px, py, xVec, 0f);
                         cnt++;
                     }
 
-                    // Vertical neighbour (the pixel we came from in y)
                     int prevY = py - yStep;
                     if (prevY >= 0 && prevY < h)
                     {
-                        float delta = CpuGetPixelDelta(normals, w, h, px, py, 0f, yVec);
-                        sum += hm[prevY * w + px] + delta;
+                        sum += hm[prevY * w + px] + CpuGetPixelDelta(normals, w, h, px, py, 0f, yVec);
                         cnt++;
                     }
 
                     hm[py * w + px] = cnt > 0 ? sum / cnt : 0f;
                 }
             }
-
             return hm;
         }
 
-        // ---- CPU fallback: CpuComputeDeltas ---------------------------------
+        // ---- CPU: CpuComputeDeltas ------------------------------------------
 
         private static void CpuComputeDeltas(
             float[] normals, int w, int h,
-            float[] deltas, uint[] flags)
+            float[] deltas, uint[] flags, int zRangeInt)
         {
-            bool wrap = (s_edgeMode == EdgeMode.Wrap);
+            // For Clamp and Wrap, all 20 samples are always included
+            bool allSamples = (s_edgeModeInt != 0);
 
             Parallel.For(0, h, py =>
             {
@@ -1295,13 +1302,13 @@ namespace FFXIV_FBX_to_Fusion
 
                     void D1(int i, bool ok, int dx, int dy, int dir)
                     {
-                        if (!wrap && !ok) return;
+                        if (!allSamples && !ok) return;
                         deltas[b + i] = GpuGetPixelDelta(normals, w, h, px, py, dx, dy, dir);
                         f |= 1u << i;
                     }
                     void D2(int i, bool ok, int ax, int ay, int da, int bx, int by, int db2)
                     {
-                        if (!wrap && !ok) return;
+                        if (!allSamples && !ok) return;
                         deltas[b + i] = GpuGetPixelDelta(normals, w, h, px, py, ax, ay, da)
                                     + GpuGetPixelDelta(normals, w, h, px, py, bx, by, db2);
                         f |= 1u << i;
@@ -1310,7 +1317,7 @@ namespace FFXIV_FBX_to_Fusion
                              int ax, int ay, int da, int bx, int by, int db2,
                              int cx, int cy, int dc, int ex, int ey, int de)
                     {
-                        if (!wrap && !ok) return;
+                        if (!allSamples && !ok) return;
                         deltas[b + i] = (GpuGetPixelDelta(normals, w, h, px, py, ax, ay, da)
                                      + GpuGetPixelDelta(normals, w, h, px, py, bx, by, db2)
                                      + GpuGetPixelDelta(normals, w, h, px, py, cx, cy, dc)
@@ -1344,14 +1351,14 @@ namespace FFXIV_FBX_to_Fusion
             });
         }
 
-        // ---- CPU fallback: CpuRunPasses -------------------------------------
+        // ---- CPU: CpuRunPasses ----------------------------------------------
 
         private static float[] CpuRunPasses(
             float[] initial, float[] deltas, uint[] enableFlags,
             int w, int h,
+            float[] mask,
             ProgressForm progress, int mipIndex, int totalMips)
         {
-            bool clamp = (s_edgeMode == EdgeMode.Clamp);
             float[] bufA = (float[])initial.Clone();
             float[] bufB = new float[w * h];
             float[] src = bufA, dst = bufB;
@@ -1366,8 +1373,9 @@ namespace FFXIV_FBX_to_Fusion
                     {
                         int idx = py * w + px;
                         uint f = enableFlags[idx];
-                        int n = clamp ? 20 : PopCount(f);
 
+                        // Free: only in-bounds (flagged) samples; Clamp/Wrap: all 20
+                        int n = (s_edgeModeInt == 0) ? PopCount(f) : 20;
                         if (n == 0) { dst[idx] = src[idx]; continue; }
 
                         double height = 0.0, scale = 1.0 / n;
@@ -1375,30 +1383,51 @@ namespace FFXIV_FBX_to_Fusion
 
                         for (int i = 0; i < 20; i++)
                         {
-                            if (!clamp && (f & (1u << i)) == 0) continue;
-                            int nx, ny;
-                            if (clamp)
+                            // Free: skip unflagged
+                            if (s_edgeModeInt == 0 && (f & (1u << i)) == 0) continue;
+
+                            int nx = px + SampleOffsets[i].x;
+                            int ny = py + SampleOffsets[i].y;
+
+                            float neighbourH;
+                            if (s_edgeModeInt == 1) // Clamp: OOB -> height 0
                             {
-                                nx = Math.Clamp(px + SampleOffsets[i].x, 0, w - 1);
-                                ny = Math.Clamp(py + SampleOffsets[i].y, 0, h - 1);
+                                neighbourH = (nx >= 0 && nx < w && ny >= 0 && ny < h)
+                                    ? src[ny * w + nx]
+                                    : 0f;
                             }
-                            else
+                            else if (s_edgeModeInt == 2) // Wrap
                             {
-                                nx = ((px + SampleOffsets[i].x) % w + w) % w;
-                                ny = ((py + SampleOffsets[i].y) % h + h) % h;
+                                nx = ((nx % w) + w) % w;
+                                ny = ((ny % h) + h) % h;
+                                neighbourH = src[ny * w + nx];
                             }
-                            height += (src[ny * w + nx] + deltas[di + i]) * scale;
+                            else // Free: flagged => guaranteed in-bounds
+                            {
+                                neighbourH = src[ny * w + nx];
+                            }
+
+                            height += (neighbourH + deltas[di + i]) * scale;
                         }
+
                         dst[idx] = (float)height;
                     }
                 });
 
                 (src, dst) = (dst, src);
             }
+
+            // Apply mask after all passes
+            if (mask != null)
+            {
+                for (int i = 0; i < src.Length; i++)
+                    if (mask[i] < 0.5f) src[i] = 0f;
+            }
+
             return src;
         }
 
-        // ---- CPU fallback: bilinear resampling ------------------------------
+        // ---- CPU: bilinear resampling ---------------------------------------
 
         private static float[] CpuBilinearDownsample4Ch(
             float[] src, int srcW, int srcH, int dstW, int dstH)
@@ -1415,10 +1444,29 @@ namespace FFXIV_FBX_to_Fusion
                     float fx = Math.Clamp(sx - x0, 0f, 1f), fy = Math.Clamp(sy - y0, 0f, 1f);
                     int db = (dy * dstW + dx) * 4;
                     for (int c = 0; c < 4; c++)
-                    {
                         dst[db + c] = src[(y0 * srcW + x0) * 4 + c] * (1 - fx) * (1 - fy) + src[(y0 * srcW + x1) * 4 + c] * fx * (1 - fy)
-                                  + src[(y1 * srcW + x0) * 4 + c] * (1 - fx) * fy + src[(y1 * srcW + x1) * 4 + c] * fx * fy;
-                    }
+                                 + src[(y1 * srcW + x0) * 4 + c] * (1 - fx) * fy + src[(y1 * srcW + x1) * 4 + c] * fx * fy;
+                }
+            });
+            return dst;
+        }
+
+        /// <summary>Bilinear downsample of a 1-channel float image (for mask resampling).</summary>
+        private static float[] CpuBilinearDownsample1Ch(
+            float[] src, int srcW, int srcH, int dstW, int dstH)
+        {
+            float[] dst = new float[dstW * dstH];
+            float scX = (float)srcW / dstW, scY = (float)srcH / dstH;
+            Parallel.For(0, dstH, dy =>
+            {
+                for (int dx = 0; dx < dstW; dx++)
+                {
+                    float sx = (dx + 0.5f) * scX - 0.5f, sy = (dy + 0.5f) * scY - 0.5f;
+                    int x0 = Math.Clamp((int)MathF.Floor(sx), 0, srcW - 1), y0 = Math.Clamp((int)MathF.Floor(sy), 0, srcH - 1);
+                    int x1 = Math.Clamp(x0 + 1, 0, srcW - 1), y1 = Math.Clamp(y0 + 1, 0, srcH - 1);
+                    float fx = Math.Clamp(sx - x0, 0f, 1f), fy = Math.Clamp(sy - y0, 0f, 1f);
+                    dst[dy * dstW + dx] = src[y0 * srcW + x0] * (1 - fx) * (1 - fy) + src[y0 * srcW + x1] * fx * (1 - fy)
+                                   + src[y1 * srcW + x0] * (1 - fx) * fy + src[y1 * srcW + x1] * fx * fy;
                 }
             });
             return dst;
@@ -1438,7 +1486,7 @@ namespace FFXIV_FBX_to_Fusion
                     int x1 = Math.Clamp(x0 + 1, 0, srcW - 1), y1 = Math.Clamp(y0 + 1, 0, srcH - 1);
                     float fx = Math.Clamp(sx - x0, 0f, 1f), fy = Math.Clamp(sy - y0, 0f, 1f);
                     dst[dy * dstW + dx] = (src[y0 * srcW + x0] * (1 - fx) * (1 - fy) + src[y0 * srcW + x1] * fx * (1 - fy)
-                                     + src[y1 * srcW + x0] * (1 - fx) * fy + src[y1 * srcW + x1] * fx * fy) * 2f;
+                                   + src[y1 * srcW + x0] * (1 - fx) * fy + src[y1 * srcW + x1] * fx * fy) * 2f;
                 }
             });
             return dst;
@@ -1446,10 +1494,6 @@ namespace FFXIV_FBX_to_Fusion
 
         // ---- Utility --------------------------------------------------------
 
-        private static int PopCount(uint v)
-        {
-            int c = 0; while (v != 0) { v &= v - 1; c++; }
-            return c;
-        }
+        private static int PopCount(uint v) { int c = 0; while (v != 0) { v &= v - 1; c++; } return c; }
     }
 }

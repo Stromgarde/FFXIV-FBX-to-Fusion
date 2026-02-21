@@ -63,13 +63,13 @@ namespace FFXIV_FBX_to_Fusion
                 blender_path_label.Text = "Please provide Blender executive path; minimum version 4.0";
             }
 
-            specular_button.Checked = true;
+            diffuse_button.Checked = true;
         }
         private void Convert()
         {
             if ((blender_path != "") && (fbx_path != ""))
             {
-                string working_path = System.IO.Path.GetDirectoryName(fbx_path);
+                string? working_path = System.IO.Path.GetDirectoryName(fbx_path);
                 string prefix = fbx_path.Split(working_path + "\\")[1].Split(".fbx")[0];
 
                 // Segment for normalizing
@@ -79,15 +79,13 @@ namespace FFXIV_FBX_to_Fusion
                 // Set up displacement deformation
                 CheckBox? cb = this.Controls["displacementDeformCheckbox"] as CheckBox;
                 bool normalizeStatus = false;
-                if (cb != null)
+                if (cb.Checked == true)
                 {
                     normalizeStatus = true;
+                    NormalToDisplacement.NormalConvert(input_file, output_file);
+                    Debug.WriteLine("Conversion finished via external call.");
+                    // End displacement
                 }
-
-                NormalToDisplacement.NormalConvert(input_file, output_file);
-
-                Debug.WriteLine("Conversion finished via external call.");
-                // End normalization
 
                 Debug.WriteLine("About to enter file check");
                 if (File.Exists(working_path + "\\mt_" + prefix + "_a_" + panel1.Controls.OfType<RadioButton>().FirstOrDefault(r => r.Checked).Name.Substring(0, 1) + ".png"))
