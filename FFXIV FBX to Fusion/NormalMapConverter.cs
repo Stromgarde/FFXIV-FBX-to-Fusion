@@ -51,7 +51,7 @@
 //   }
 //
 // -----------------------------------------------------------------------------
-// Derived from the following package:
+// Created largely by Claude.ai and derived from the following package:
 // https://skgenius.co.uk/FileDump/NormalToHeight_v0.5.1.zip
 // Discussed here:
 // https://www.reddit.com/r/gamedev/comments/fffskm/convert_normal_map_to_displacement_map/
