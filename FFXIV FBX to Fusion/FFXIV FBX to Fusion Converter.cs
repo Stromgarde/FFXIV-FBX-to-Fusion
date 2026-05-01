@@ -142,7 +142,7 @@ namespace FFXIV_FBX_to_Fusion
                             "OBJECT_NAME = '" + prefix + "'",
                             "SUBDIV_LEVEL = 4", // 4 is as high as can be done without causing massive problems with processing
                             // --- 0.0015 seems to be strongest without substantial negative impacts on geometry, but 0.004 seems like the "correct" value for when geometry is not an issue
-                            "DISPLACE_STRENGTH = 0.0015",
+                            "DISPLACE_STRENGTH = 0.0030",
 
                             // Make sure we are in object mode
                             "bpy.ops.object.mode_set(mode = 'OBJECT')",
